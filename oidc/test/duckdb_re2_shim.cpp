@@ -17,6 +17,9 @@ namespace duckdb {
 [[noreturn]] void ThrowNullSharedPtrDereference() {
 	std::abort();
 }
+[[noreturn]] void ThrowVectorIndexOutOfBounds(idx_t, idx_t) {
+	std::abort();
+}
 // duckdb's checked vector (Match::groups) throws InternalException on a bad index, which the
 // sanitizer builds keep as a real reference: the exception's shape, without its formatting
 Exception::Exception(ExceptionType, const string &message) : std::runtime_error(message) {
