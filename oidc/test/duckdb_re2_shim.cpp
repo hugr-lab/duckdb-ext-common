@@ -2,6 +2,7 @@
 // httplib parses status lines and query strings through it, and the real one reaches into duckdb's
 // exception machinery, which a duckdb-free test must not link. Same semantics over the same bundled
 // re2, minus the throws; a consumer links duckdb's own. Identical on the v1.5.5 and 2.0 lines.
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/re2_regex.hpp"
 
@@ -15,6 +16,23 @@ namespace duckdb {
 }
 [[noreturn]] void ThrowNullSharedPtrDereference() {
 	std::abort();
+}
+// duckdb's checked vector (Match::groups) throws InternalException on a bad index, which the
+// sanitizer builds keep as a real reference: the exception's shape, without its formatting
+Exception::Exception(ExceptionType, const string &message) : std::runtime_error(message) {
+}
+InternalException::InternalException(const string &msg) : Exception(ExceptionType::INTERNAL, msg) {
+}
+string Exception::ConstructMessageRecursive(const string &msg, std::vector<ExceptionFormatValue> &) {
+	return msg;
+}
+hugeint_t::hugeint_t(int64_t value) : lower(static_cast<uint64_t>(value)), upper(value < 0 ? -1 : 0) {
+}
+ExceptionFormatValue::ExceptionFormatValue(int64_t int_val_p)
+    : type(ExceptionFormatValueType::FORMAT_VALUE_TYPE_INTEGER), int_val(int_val_p) {
+}
+ExceptionFormatValue::ExceptionFormatValue(idx_t uint_val)
+    : type(ExceptionFormatValueType::FORMAT_VALUE_TYPE_INTEGER), int_val(static_cast<int64_t>(uint_val)) {
 }
 } // namespace duckdb
 

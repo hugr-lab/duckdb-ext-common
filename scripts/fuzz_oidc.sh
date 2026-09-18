@@ -7,13 +7,14 @@ set -euo pipefail
 duckdb="${1:?usage: fuzz_oidc.sh <duckdb source dir> [build dir]}"
 out="${2:-build/oidc-fuzz}"
 cxx="${CXX:-clang++}"
+flags="${CXXFLAGS:-}" # extra flags
 seconds="${FUZZ_SECONDS:-30}"
 mkdir -p "$out"
 # the bundled httplib parses status lines and query strings through duckdb's RegexMatch wrapper over
 # its bundled re2: re2 is compiled in from the same tree and the wrapper is the test's own shim
 # (duckdb's reaches into its exception machinery), so the binary links nothing of a built duckdb
 re2="$(find "$duckdb/third_party/re2" -name '*.cc' | sort | tr '\n' ' ') oidc/test/duckdb_re2_shim.cpp"
-"$cxx" -std=c++17 -g -O1 -pthread -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+"$cxx" $flags -std=c++17 -g -O1 -pthread -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
 	-DDUCKDB_EXT_COMMON_OIDC_NAMESPACE=ext_common \
 	-I oidc/include -I "$duckdb/third_party/httplib" -I "$duckdb/third_party/yyjson/include" \
 	-I "$duckdb/src/include" -I "$duckdb/third_party/fmt/include" -I "$duckdb/third_party/re2" \
