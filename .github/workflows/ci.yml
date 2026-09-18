@@ -1,0 +1,59 @@
+# CI for the shared headers and modules (charter, specs/001): format, and every header compiling on
+# its own against each duckdb line a consumer builds on (R9). No duckdb build: a sparse clone of the
+# duckdb tree is all a header check needs.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # duckdb's pinned formatter (scripts/format.py: clang_format==11.0.1), called by full path so no
+      # runner binary can shadow it
+      - name: Install duckdb's pinned clang-format
+        run: |
+          python3 -m venv /tmp/cf
+          /tmp/cf/bin/pip install clang_format==11.0.1
+      - name: clang-format check
+        run: |
+          files="$(find hooks contracts oidc \( -name '*.hpp' -o -name '*.cpp' \) 2>/dev/null)"
+          if [ -z "$files" ]; then echo "no sources yet"; exit 0; fi
+          echo "$files" | xargs /tmp/cf/bin/clang-format --dry-run --Werror
+      - name: yamllint
+        run: |
+          pip install yamllint
+          yamllint .github/workflows
+
+  headers:
+    name: Headers compile (duckdb ${{ matrix.duckdb }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # every line a consumer builds on (R9): the release mssql-ducklake pins, and the 2.0 line
+        # duckdb-acl and acl-otel track
+        duckdb: [v1.5.5, v2.0-cyanoptera]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Sparse clone of duckdb ${{ matrix.duckdb }}
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse --branch ${{ matrix.duckdb }} \
+            https://github.com/duckdb/duckdb /tmp/duckdb
+          git -C /tmp/duckdb sparse-checkout set src/include third_party
+      # .clang-format is a real copy (a symlink into a submodule dangles in a checkout without
+      # submodules); this is where a drift from duckdb's shows up
+      - name: .clang-format is duckdb's
+        run: diff <(tail -n +2 .clang-format) /tmp/duckdb/.clang-format
+      - name: Every header compiles on its own
+        run: scripts/check_headers.sh /tmp/duckdb

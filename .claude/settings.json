@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(scripts/check_headers.sh:*)",
+      "Bash(clang-format:*)",
+      "Bash(git status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git checkout:*)",
+      "Bash(git tag:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh api:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:duckdb.org)"
+    ]
+  }
+}

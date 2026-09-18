@@ -1,0 +1,8 @@
+build/
+.cache/
+.DS_Store
+.idea/
+.vscode/*.log
+
+# local design / research scratch (not committed)
+design/
