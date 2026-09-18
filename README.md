@@ -14,8 +14,9 @@ Consumers today and soon: [duckdb-acl](https://github.com/hugr-lab/duckdb-acl),
 [acl-otel](https://github.com/hugr-lab/acl-otel), tresor (secrets-service client), mirror (ingest),
 [mssql-extension](https://github.com/hugr-lab/mssql-extension).
 
-**Status**: charter only — the first contents arrive with the duckdb-acl migration and the tresor
-bootstrap ([specs/001](specs/001-charter/spec.md), "Initial contents").
+**Status**: the audit contract and the OIDC core are in ([specs/002](specs/002-acl-migration/spec.md));
+`hooks/` and the tresor contract arrive with the tresor bootstrap ([specs/001](specs/001-charter/spec.md),
+"Initial contents").
 
 ## Why a separate repository
 
@@ -35,7 +36,8 @@ git -C duckdb-ext-common checkout <tag>
 include_directories(duckdb-ext-common/hooks duckdb-ext-common/contracts)
 ```
 
-A module (`oidc/`) is consumed through its CMake target — see the module's README once it lands.
+A module (`oidc/`) is consumed through `oidc/oidc.cmake` — a list of sources and an include dir the
+consumer compiles into itself under a namespace it names; see [oidc/README.md](oidc/README.md).
 
 ## The rules, in short
 
@@ -49,7 +51,9 @@ over:
    which refuses a mismatch. **Any layout change bumps the version.**
 4. A contract belongs to its producer; `hooks/` and `oidc/` change only through a spec here.
 5. Audit contracts never carry secrets, tokens, bearer handles, statement text or parameters.
-6. Headers compile against every duckdb line a consumer builds on (today v1.5.5 and the 2.0 line).
+6. Headers compile alone against the duckdb line the consumers build on (the 2.0 line in CI).
+7. A module compiled into several consumers produces no identical symbols: the consumer names
+   its namespace (R13).
 
 ## Compatibility
 

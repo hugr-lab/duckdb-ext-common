@@ -1,6 +1,8 @@
-# CI for the shared headers and modules (charter, specs/001): format, and every header compiling on
-# its own against each duckdb line a consumer builds on (R9). No duckdb build: a sparse clone of the
-# duckdb tree is all a header check needs.
+# CI for the shared headers and modules (charter, specs/001): format, every header compiling on its
+# own against the duckdb line the consumers build on, the OIDC core's own test, and its parsers under
+# libFuzzer. No duckdb build: a sparse clone of the duckdb tree is all any of it needs. The line is
+# the 2.0 line alone (`v2.0-cyanoptera`, what duckdb-acl and acl-otel pin) - the owner's decision of
+# 2026-09-18 (spec 002); v1.5.5 is not a target here.
 name: CI
 
 on:
@@ -12,6 +14,9 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  DUCKDB_REF: v2.0-cyanoptera
 
 jobs:
   lint:
@@ -36,19 +41,13 @@ jobs:
           yamllint .github/workflows
 
   headers:
-    name: Headers compile (duckdb ${{ matrix.duckdb }})
+    name: Headers compile (duckdb v2.0-cyanoptera)
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        # every line a consumer builds on (R9): the release mssql-ducklake pins, and the 2.0 line
-        # duckdb-acl and acl-otel track
-        duckdb: [v1.5.5, v2.0-cyanoptera]
     steps:
       - uses: actions/checkout@v7
-      - name: Sparse clone of duckdb ${{ matrix.duckdb }}
+      - name: Sparse clone of duckdb
         run: |
-          git clone --depth 1 --filter=blob:none --sparse --branch ${{ matrix.duckdb }} \
+          git clone --depth 1 --filter=blob:none --sparse --branch "$DUCKDB_REF" \
             https://github.com/duckdb/duckdb /tmp/duckdb
           git -C /tmp/duckdb sparse-checkout set src/include third_party
       # .clang-format is a real copy (a symlink into a submodule dangles in a checkout without
@@ -57,3 +56,36 @@ jobs:
         run: diff <(tail -n +2 .clang-format) /tmp/duckdb/.clang-format
       - name: Every header compiles on its own
         run: scripts/check_headers.sh /tmp/duckdb
+
+  oidc:
+    name: OIDC core test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Sparse clone of duckdb
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse --branch "$DUCKDB_REF" \
+            https://github.com/duckdb/duckdb /tmp/duckdb
+          git -C /tmp/duckdb sparse-checkout set src/include third_party
+      # the module, its test and the bundled third party from the tree - nothing of a built duckdb
+      - name: The fake-IdP test
+        run: scripts/test_oidc.sh /tmp/duckdb build/oidc-test
+
+  fuzz:
+    name: Fuzz the OIDC parsers (clang, 60 s)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Sparse clone of duckdb
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse --branch "$DUCKDB_REF" \
+            https://github.com/duckdb/duckdb /tmp/duckdb
+          git -C /tmp/duckdb sparse-checkout set src/include third_party
+      # clang carries libFuzzer; the discovery, token and device parsers are a consumer's
+      # pre-authentication network input
+      - name: libFuzzer over the parsers
+        run: CXX=clang++ FUZZ_SECONDS=60 scripts/fuzz_oidc.sh /tmp/duckdb build/oidc-fuzz

@@ -7,4 +7,4 @@ share has the same `CONTRACT_VERSION` in both.
 
 | Tag | Contract | Magic | Version | Producer | Checked against |
 | --- | --- | --- | --- | --- | --- |
-| — | *(no tag yet: the first contents arrive with the duckdb-acl migration and the tresor bootstrap)* | | | | |
+| v0.1.0 | `acl_audit` (`contracts/acl_audit.hpp` + `acl_principal.hpp`) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 002) |
