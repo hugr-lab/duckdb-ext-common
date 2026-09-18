@@ -1,13 +1,32 @@
 # oidc/ — the OIDC client core
 
-duckdb-free token acquisition shared by duckdb-acl, tresor and (later) mssql-extension (charter R10):
-endpoint discovery (RFC 8414, with the issuer-match check), the client-credentials, refresh-token and
-device (RFC 8628) flows, and a token cache with a refresh margin. Uses only the httplib and yyjson
-duckdb bundles, taken from the consumer's own duckdb tree; TLS comes from the consumer's build.
+duckdb-free token acquisition shared by duckdb-acl, tresor and (later) mssql-extension (charter
+R10): endpoint discovery (RFC 8414, with the issuer-match check), the client-credentials, password,
+refresh-token and device (RFC 8628) flows, the parsers behind them, and a token cache with a refresh
+margin. Uses only the httplib and yyjson duckdb bundles, taken from the consumer's own duckdb tree;
+TLS comes from the consumer's build. From duckdb-acl spec 060, moved here by spec 002.
 
-**Empty until the duckdb-acl migration** — it moves duckdb-acl spec 060's module here with its tests.
-The tresor bootstrap then adds, through a spec here: authorization code + PKCE with a loopback
-redirect (RFC 8252), `private_key_jwt` (RFC 7523), federated assertions, and the Azure credential
-sources from mssql-extension.
+## Consuming it
 
-Namespace: `duckdb::ext_common::oidc`. Consumed through its CMake target (defined when it lands).
+```cmake
+include(duckdb-ext-common/oidc/oidc.cmake)
+include_directories(${DUCKDB_EXT_COMMON_OIDC_INCLUDE} duckdb/third_party/httplib duckdb/third_party/yyjson/include)
+list(APPEND EXTENSION_SOURCES ${DUCKDB_EXT_COMMON_OIDC_SOURCES})
+target_compile_definitions(<target> PRIVATE DUCKDB_EXT_COMMON_OIDC_NAMESPACE=<ns>)   # your extension's namespace
+target_compile_definitions(<target> PRIVATE DUCKDB_EXT_COMMON_OIDC_TLS=1)            # where you link OpenSSL
+```
+
+The namespace is yours (charter R13): the header refuses to compile without
+`DUCKDB_EXT_COMMON_OIDC_NAMESPACE`, and the names become `duckdb::<ns>::oidc::...` - duckdb-acl
+says `acl`, tresor `tresor`. Every TU that includes `oidc_core.hpp` needs the definition, the
+standalone tests of your own included.
+
+## Testing it
+
+```sh
+scripts/test_oidc.sh <duckdb source tree>       # the fake-IdP test, nothing of a built duckdb
+CXX=clang++ scripts/fuzz_oidc.sh <duckdb tree>  # the parsers under libFuzzer (linux)
+```
+
+Layout: `include/oidc_core.hpp`, `src/oidc_core.cpp`, `oidc.cmake`, `test/` (the test and a shim of
+duckdb's `RegexMatch` wrapper the bundled httplib reaches for), `fuzz/` (the target and its corpus).

@@ -24,6 +24,8 @@ Deeper research lives in the local, gitignored `design/` folder.
   API stable across them.
 - **R10** — `oidc/` and future modules include nothing from `duckdb/` (bundled httplib/yyjson from the
   consumer's tree are fine) and ship their own tests.
+- **R13** — a module's namespace is the consumer's (`DUCKDB_EXT_COMMON_OIDC_NAMESPACE`, refused when
+  unset) and its TUs are hidden-visibility: two consumers in one image never share a symbol.
 
 ## Layout
 
@@ -31,9 +33,11 @@ Deeper research lives in the local, gitignored `design/` folder.
 hooks/        header-only base: stamped registry + Reach, sinks, delivery queue, counters/gauges,
               per-connection state helper                      (owner: through specs here)
 contracts/    acl_*.hpp (duckdb-acl), tresor_*.hpp (tresor), mirror_*.hpp (mirror)
-oidc/         OIDC client core, duckdb-free, sources + CMake target + tests (owner: through specs here)
+oidc/         OIDC client core, duckdb-free: include/, src/, oidc.cmake (a source list), test/, fuzz/
+              (owner: through specs here; spec 002 brought it from duckdb-acl)
 docs/         compatibility.md — per tag, every contract's version
-scripts/      check_headers.sh — every header compiles alone against a duckdb tree
+scripts/      check_headers.sh — every header compiles alone against a duckdb tree;
+              test_oidc.sh / fuzz_oidc.sh — the module's test and fuzzer against a duckdb tree
 specs/        one lightweight spec per change (see specs/README.md)
 design/       LOCAL, gitignored research scratch
 ```
@@ -41,10 +45,15 @@ design/       LOCAL, gitignored research scratch
 ## Commands
 
 ```sh
-git clone --depth 1 --branch v1.5.5 https://github.com/duckdb/duckdb /tmp/duckdb-1.5.5   # or any local duckdb tree
-scripts/check_headers.sh /tmp/duckdb-1.5.5             # every hooks/ and contracts/ header, alone, -fsyntax-only
+git clone --depth 1 --branch v2.0-cyanoptera https://github.com/duckdb/duckdb /tmp/duckdb   # or a consumer's duckdb/ submodule
+scripts/check_headers.sh /tmp/duckdb                   # every hooks/ and contracts/ header, alone, -fsyntax-only
+scripts/test_oidc.sh /tmp/duckdb                       # the OIDC core's test: the module + bundled third party, no built duckdb
+CXX=clang++ scripts/fuzz_oidc.sh /tmp/duckdb           # its parsers under libFuzzer (linux)
 find hooks contracts oidc \( -name '*.hpp' -o -name '*.cpp' \) | xargs clang-format --dry-run --Werror  # pin 11.0.1
 ```
+
+The duckdb line is the **2.0 line** (`v2.0-cyanoptera`), the owner's decision of 2026-09-18; CI
+checks nothing against v1.5.5.
 
 ## Code style
 

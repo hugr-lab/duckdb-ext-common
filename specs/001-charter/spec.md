@@ -101,6 +101,13 @@ a module is consumed through its CMake target. Never a vendored copy.
 **R12. Tags.** Every change a consumer's release depends on gets a tag (`vMAJOR.MINOR.PATCH`); the
 release notes name which contracts changed and their new versions.
 
+**R13. A module compiled into several consumers produces no identical symbols** (added 2026-09-18,
+spec 002). A duckdb-free module opens its namespace under one the consumer names
+(`DUCKDB_EXT_COMMON_<MODULE>_NAMESPACE`, refused when unset), and its TUs are compiled with hidden
+visibility where the compiler has it: a static bundle of two consumers, or a statically linked
+consumer beside a co-loaded loadable on a flat namespace, must never find one copy through the
+other's symbols.
+
 ### Initial contents — who brings what
 
 | Content | Brought by | Notes |
