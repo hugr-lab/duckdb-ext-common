@@ -1,7 +1,8 @@
 // A test-only stand-in for duckdb's thin RegexMatch wrapper (src/common/re2_regex.cpp): the bundled
 // httplib parses status lines and query strings through it, and the real one reaches into duckdb's
 // exception machinery, which a duckdb-free test must not link. Same semantics over the same bundled
-// re2, minus the throws; a consumer links duckdb's own. Identical on the v1.5.5 and 2.0 lines.
+// re2, minus the throws; a consumer links duckdb's own. Written for the 2.0 line (the throw helpers
+// below are its memory_safety.hpp); a sanitizer build keeps every one of these references alive.
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/re2_regex.hpp"
