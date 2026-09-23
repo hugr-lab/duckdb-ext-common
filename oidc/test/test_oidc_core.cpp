@@ -14,7 +14,9 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <mutex>
+#include <vector>
 
 #ifndef _WIN32
 #include <arpa/inet.h>
@@ -60,6 +62,8 @@ struct FakeIdp {
 	std::string auth_challenge;    // the code_challenge of the last /authorize
 	std::string auth_redirect_uri; // and its redirect_uri
 	std::atomic<int> codes_exchanged {0};
+	std::mutex exchange_mutex;
+	std::map<std::string, std::string> last_exchange; // the params of the last token exchange
 
 	std::string Issuer() const {
 		return "http://127.0.0.1:" + std::to_string(port);
@@ -158,6 +162,47 @@ struct FakeIdp {
 					res.set_content("{\"access_token\":\"pw-token-2\",\"expires_in\":60}", "application/json");
 				} else {
 					deny("invalid_grant", "unknown refresh token");
+				}
+				return;
+			}
+			if (grant == "urn:ietf:params:oauth:grant-type:token-exchange") {
+				{
+					std::lock_guard<std::mutex> guard(exchange_mutex);
+					last_exchange.clear();
+					for (auto &param : req.params) {
+						last_exchange[param.first] = param.second;
+					}
+				}
+				const std::string at = "urn:ietf:params:oauth:token-type:access_token";
+				if (req.get_param_value("client_id") != "node" ||
+				    req.get_param_value("client_secret") != "node-secret") {
+					deny("invalid_client", "bad client");
+				} else if (req.get_param_value("subject_token") != "user-token-for-node" ||
+				           req.get_param_value("subject_token_type") != at ||
+				           req.get_param_value("requested_token_type") != at) {
+					deny("invalid_grant", "unknown subject token");
+				} else if (req.get_param_value("audience") == "forbidden") {
+					deny("invalid_target", "the client may not reach that audience");
+				} else if (req.get_param_value("audience") == "hand-me-a-refresh-token") {
+					res.set_content("{\"access_token\":\"rt-in-disguise\",\"issued_token_type\":"
+					                "\"urn:ietf:params:oauth:token-type:refresh_token\"}",
+					                "application/json");
+				} else {
+					res.set_content("{\"access_token\":\"exchanged-for-" + req.get_param_value("audience") +
+					                    "\",\"issued_token_type\":\"" + at + "\",\"expires_in\":300}",
+					                "application/json");
+				}
+				return;
+			}
+			if (grant == "urn:ietf:params:oauth:grant-type:jwt-bearer") {
+				if (req.get_param_value("requested_token_use") != "on_behalf_of" ||
+				    req.get_param_value("assertion") != "user-token-for-node" ||
+				    req.get_param_value("client_secret") != "node-secret") {
+					deny("invalid_grant", "AADSTS50013: the assertion is not valid");
+				} else {
+					res.set_content("{\"access_token\":\"obo-for-" + req.get_param_value("scope") +
+					                    "\",\"expires_in\":300}",
+					                "application/json");
 				}
 				return;
 			}
@@ -435,6 +480,47 @@ int main() {
 		                                        HttpGet(idp.Issuer() + "/downgrade/.well-known/openid-configuration"));
 		Check(!downgrade.Ok() && downgrade.error.find("cleartext endpoint") != std::string::npos,
 		      "a cleartext authorization endpoint of an https issuer is refused: " + downgrade.error);
+	});
+
+	Scenario("token exchange (RFC 8693) and Entra's On-Behalf-Of", [&] {
+		auto exchanged = TokenExchange(ep, "node", "node-secret", "user-token-for-node", "duckdb-secrets");
+		Check(exchanged.Ok() && exchanged.access_token == "exchanged-for-duckdb-secrets",
+		      "the token is exchanged for the audience: " + exchanged.error);
+		Check(exchanged.issued_token_type == "urn:ietf:params:oauth:token-type:access_token" &&
+		          exchanged.expires_at > 0,
+		      "with its issued_token_type and expiry");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(!idp.last_exchange.count("scope") && !idp.last_exchange.count("resource"),
+			      "scope and resource are absent when not given");
+		}
+		TokenExchange(ep, "node", "node-secret", "user-token-for-node", "duckdb-secrets", "openid", "https://api/");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(idp.last_exchange["scope"] == "openid" && idp.last_exchange["resource"] == "https://api/",
+			      "and passed through when given");
+		}
+		std::vector<TokenSet> refusals {
+		    TokenExchange(ep, "node", "wrong", "user-token-for-node", "duckdb-secrets"),
+		    TokenExchange(ep, "node", "node-secret", "someone-elses-token", "duckdb-secrets"),
+		    TokenExchange(ep, "node", "node-secret", "user-token-for-node", "forbidden"),
+		    TokenExchange(ep, "node", "node-secret", "user-token-for-node", "hand-me-a-refresh-token")};
+		Check(!refusals[0].Ok() && refusals[0].error_code == "invalid_client", "a wrong client secret");
+		Check(!refusals[1].Ok() && refusals[1].error_code == "invalid_grant", "an unknown subject token");
+		Check(!refusals[2].Ok() && refusals[2].error_code == "invalid_target", "an audience out of reach");
+		Check(!refusals[3].Ok() && refusals[3].error_code == "invalid_token_type" && refusals[3].access_token.empty(),
+		      "a refresh token in an access token's place is refused, and not handed out: " + refusals[3].error);
+		for (auto &refusal : refusals) {
+			Check(refusal.error.find("user-token-for-node") == std::string::npos &&
+			          refusal.error.find("rt-in-disguise") == std::string::npos,
+			      "no token in an error: " + refusal.error);
+		}
+		auto obo = OnBehalfOf(ep, "node", "node-secret", "user-token-for-node", "api://secrets/.default");
+		Check(obo.Ok() && obo.access_token == "obo-for-api://secrets/.default", "On-Behalf-Of: " + obo.error);
+		auto obo_refused = OnBehalfOf(ep, "node", "node-secret", "stale", "api://secrets/.default");
+		Check(!obo_refused.Ok() && obo_refused.error_code == "invalid_grant" &&
+		          obo_refused.error.find("stale") == std::string::npos,
+		      "On-Behalf-Of refused, the IdP's words, not the token: " + obo_refused.error);
 	});
 
 	Scenario("the TLS branch is compiled in exactly when DUCKDB_EXT_COMMON_OIDC_TLS is", [&] {

@@ -343,6 +343,7 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 	if (response.Ok()) {
 		out.access_token = json.Str("access_token");
 		out.refresh_token = json.Str("refresh_token");
+		out.issued_token_type = json.Str("issued_token_type");
 		auto expires_in = json.Int("expires_in");
 		static constexpr int64_t A_YEAR = int64_t(366) * 86400;
 		if (expires_in > A_YEAR) { // a year: past that the value is nonsense, and unclamped it
@@ -467,6 +468,58 @@ TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const 
 		params["scope"] = scope;
 	}
 	return PostGrant(ep, params);
+}
+
+namespace {
+const char *ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
+
+//! An exchange asked for an access token: anything else in its place (a refresh or ID token) must not be
+//! used as one. Neither token ever reaches the message.
+TokenSet OnlyAccessTokens(TokenSet out) {
+	if (out.Ok() && !out.issued_token_type.empty() && out.issued_token_type != ACCESS_TOKEN_TYPE) {
+		TokenSet refused;
+		refused.error = "the exchange answered with a " + out.issued_token_type + ", not an access token";
+		refused.error_code = "invalid_token_type";
+		return refused;
+	}
+	return out;
+}
+} // namespace
+
+TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                       const std::string &subject_token, const std::string &audience, const std::string &scope,
+                       const std::string &resource) {
+	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"},
+	                                           {"client_id", client_id},
+	                                           {"subject_token", subject_token},
+	                                           {"subject_token_type", ACCESS_TOKEN_TYPE},
+	                                           {"requested_token_type", ACCESS_TOKEN_TYPE}};
+	if (!client_secret.empty()) {
+		params["client_secret"] = client_secret;
+	}
+	if (!audience.empty()) {
+		params["audience"] = audience;
+	}
+	if (!scope.empty()) {
+		params["scope"] = scope;
+	}
+	if (!resource.empty()) {
+		params["resource"] = resource;
+	}
+	return OnlyAccessTokens(PostGrant(ep, params));
+}
+
+TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                    const std::string &assertion, const std::string &scope) {
+	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+	                                           {"client_id", client_id},
+	                                           {"assertion", assertion},
+	                                           {"requested_token_use", "on_behalf_of"},
+	                                           {"scope", scope}};
+	if (!client_secret.empty()) {
+		params["client_secret"] = client_secret;
+	}
+	return OnlyAccessTokens(PostGrant(ep, params));
 }
 
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,

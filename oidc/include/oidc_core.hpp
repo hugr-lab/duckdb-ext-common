@@ -78,8 +78,9 @@ Endpoints Discover(const std::string &issuer_url, int timeout_seconds = 10);
 //! invalid_grant, ...), empty on success.
 struct TokenSet {
 	std::string access_token;
-	std::string refresh_token; // empty when the grant returns none
-	int64_t expires_at = 0;    // epoch seconds; 0 = the response carried no expiry
+	std::string refresh_token;     // empty when the grant returns none
+	int64_t expires_at = 0;        // epoch seconds; 0 = the response carried no expiry
+	std::string issued_token_type; // RFC 8693's answer field; empty when the response carried none
 	std::string error;
 	std::string error_code;
 
@@ -96,6 +97,18 @@ TokenSet ClientCredentials(const Endpoints &ep, const std::string &client_id, co
 //! admin allow it (design/016: an admin-enabled row of the menu, never forced).
 TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &username, const std::string &password, const std::string &scope = "");
+
+//! RFC 8693 token exchange (spec 004): the client (client_secret_post; empty secret for a public one)
+//! presents `subject_token` - an access token it received - and asks the IdP for an access token for
+//! `audience` (and/or `resource`, `scope`). An answer that is not an access token is refused.
+TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                       const std::string &subject_token, const std::string &audience, const std::string &scope = "",
+                       const std::string &resource = "");
+
+//! Entra's On-Behalf-Of (RFC 7523 jwt-bearer, requested_token_use=on_behalf_of): `assertion` is the
+//! access token the client received, `scope` names the downstream API (api://.../.default).
+TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                    const std::string &assertion, const std::string &scope);
 
 //! grant_type=refresh_token — silent renewal off a previous TokenSet.
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
