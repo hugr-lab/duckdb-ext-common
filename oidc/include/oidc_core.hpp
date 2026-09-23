@@ -100,13 +100,15 @@ TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const 
 
 //! RFC 8693 token exchange (spec 004): the client (client_secret_post; empty secret for a public one)
 //! presents `subject_token` - an access token it received - and asks the IdP for an access token for
-//! `audience` (and/or `resource`, `scope`). An answer that is not an access token is refused.
+//! `audience` (and/or `resource`, `scope`; at least one). An answer that is not an access token is refused,
+//! a refresh token in the answer is dropped, and the subject token never appears in an error.
 TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &subject_token, const std::string &audience, const std::string &scope = "",
                        const std::string &resource = "");
 
 //! Entra's On-Behalf-Of (RFC 7523 jwt-bearer, requested_token_use=on_behalf_of): `assertion` is the
-//! access token the client received, `scope` names the downstream API (api://.../.default).
+//! access token the client received, `scope` names the downstream API (api://.../.default). Both required;
+//! the answer is treated as TokenExchange's.
 TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                     const std::string &assertion, const std::string &scope);
 

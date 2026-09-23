@@ -355,8 +355,8 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 		}
 		return out;
 	}
-	out.error_code = json.Str("error");
-	auto description = json.Str("error_description");
+	out.error_code = Printable(json.Str("error").substr(0, 64));
+	auto description = Printable(json.Str("error_description"));
 	out.error = out.error_code.empty() ? ("HTTP " + std::to_string(response.status) + " from the token endpoint")
 	                                   : (out.error_code + (description.empty() ? "" : (": " + description)));
 	return out;
@@ -471,16 +471,31 @@ TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const 
 }
 
 namespace {
-const char *ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
+constexpr const char *ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
 
-//! An exchange asked for an access token: anything else in its place (a refresh or ID token) must not be
-//! used as one. Neither token ever reaches the message.
-TokenSet OnlyAccessTokens(TokenSet out) {
+TokenSet Refused(const std::string &code, const std::string &message) {
+	TokenSet refused;
+	refused.error_code = code;
+	refused.error = message;
+	return refused;
+}
+
+//! The end of every exchange (spec 004):
+//! - an answer that is not an access token (a refresh or ID token in its place) is refused, not used as one;
+//! - a refresh token is dropped: an exchanged token belongs to one session, and must not outlive it;
+//! - the presented token never reaches an error, even when the IdP quotes it back.
+TokenSet FinishExchange(TokenSet out, const std::string &presented) {
 	if (out.Ok() && !out.issued_token_type.empty() && out.issued_token_type != ACCESS_TOKEN_TYPE) {
-		TokenSet refused;
-		refused.error = "the exchange answered with a " + out.issued_token_type + ", not an access token";
-		refused.error_code = "invalid_token_type";
-		return refused;
+		return Refused("invalid_token_type", "the exchange answered with something other than an access token");
+	}
+	out.refresh_token.clear();
+	if (!out.Ok()) {
+		out.access_token.clear();
+		out.issued_token_type.clear();
+		for (auto at = out.error.find(presented); !presented.empty() && at != std::string::npos;
+		     at = out.error.find(presented, at)) {
+			out.error.replace(at, presented.size(), "<redacted>");
+		}
 	}
 	return out;
 }
@@ -489,6 +504,13 @@ TokenSet OnlyAccessTokens(TokenSet out) {
 TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &subject_token, const std::string &audience, const std::string &scope,
                        const std::string &resource) {
+	if (subject_token.empty()) {
+		return Refused("invalid_request", "token exchange: no subject token");
+	}
+	if (audience.empty() && scope.empty() && resource.empty()) {
+		// the IdP would answer with a token for every audience the client may reach
+		return Refused("invalid_request", "token exchange: no audience, resource or scope to exchange for");
+	}
 	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"},
 	                                           {"client_id", client_id},
 	                                           {"subject_token", subject_token},
@@ -506,11 +528,14 @@ TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const 
 	if (!resource.empty()) {
 		params["resource"] = resource;
 	}
-	return OnlyAccessTokens(PostGrant(ep, params));
+	return FinishExchange(PostGrant(ep, params), subject_token);
 }
 
 TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                     const std::string &assertion, const std::string &scope) {
+	if (assertion.empty() || scope.empty()) {
+		return Refused("invalid_request", "on-behalf-of: an assertion and a scope are required");
+	}
 	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
 	                                           {"client_id", client_id},
 	                                           {"assertion", assertion},
@@ -519,7 +544,7 @@ TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std
 	if (!client_secret.empty()) {
 		params["client_secret"] = client_secret;
 	}
-	return OnlyAccessTokens(PostGrant(ep, params));
+	return FinishExchange(PostGrant(ep, params), assertion);
 }
 
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
@@ -556,7 +581,7 @@ DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response) {
 		auto code = json.Str("error");
 		out.error = !response.error.empty() ? response.error
 		            : code.empty()          ? ("HTTP " + std::to_string(response.status))
-		                                    : (code + ": " + json.Str("error_description"));
+		                           : (Printable(code.substr(0, 64)) + ": " + Printable(json.Str("error_description")));
 		return out;
 	}
 	Json json(response.body);
