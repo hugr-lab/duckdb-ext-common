@@ -742,7 +742,8 @@ LoopbackRedirect::Result LoopbackRedirect::Wait(int64_t deadline_epoch_seconds,
 			if (NowSeconds() >= deadline_epoch_seconds) {
 				out.error = "the login timed out before the browser returned";
 				out.error_code = "expired_token";
-				impl->done = true; // late callbacks are refused from here on
+				impl->done = true;  // late callbacks are refused from here on
+				impl->result = out; // and a second Wait reports this end
 				break;
 			}
 			impl->arrived.wait_for(lock, std::chrono::milliseconds(200));
@@ -757,6 +758,7 @@ LoopbackRedirect::Result LoopbackRedirect::Wait(int64_t deadline_epoch_seconds,
 				out.error = "login cancelled";
 				out.error_code = "cancelled";
 				impl->done = true;
+				impl->result = out;
 				break;
 			}
 		}
