@@ -14,3 +14,5 @@ share has the same `CONTRACT_VERSION` in both.
 | v0.4.0 | `acl_connection` (`contracts/acl_connection.hpp`, new) | `ACLC` | 1 | duckdb-acl | `v2.0-cyanoptera` (spec 005) |
 | v0.5.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 006: `oidc/` only - token exchange with a refresh token, when asked) |
 | v0.5.0 | `acl_connection` (unchanged) | `ACLC` | 1 | duckdb-acl | `v2.0-cyanoptera` |
+| v0.6.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` |
+| v0.6.0 | `acl_connection` | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 007: the publisher mark on `AclSessionHooks`) |

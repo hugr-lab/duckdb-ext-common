@@ -10,6 +10,6 @@ Contents (charter, "Initial contents"):
 | --- | --- | --- | --- |
 | `acl_audit.hpp` + `acl_principal.hpp` | duckdb-acl | acl-otel | **spec 002** — moved as is, magic `ACLA`, version 2, no bump; `Principal` is part of the layout |
 | `tresor_audit.hpp` | tresor | acl-otel | the tresor bootstrap, on top of `hooks/` |
-| `acl_connection.hpp` | duckdb-acl | tresor | **spec 005** - magic `ACLC`, version 1: `AclConnection` (the session of the running statement, per connection) and `AclSessionHooks` (session open/close observers) |
+| `acl_connection.hpp` | duckdb-acl | tresor | **spec 005** - magic `ACLC`, version 2 (spec 007: the publisher mark): `AclConnection` (the session of the running statement, per connection) and `AclSessionHooks` (session open/close observers) |
 
 Namespace: `duckdb::<producer>` (`duckdb::acl`, `duckdb::tresor`).
