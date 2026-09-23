@@ -2,7 +2,9 @@
 
 duckdb-free token acquisition shared by duckdb-acl, tresor and (later) mssql-extension (charter
 R10): endpoint discovery (RFC 8414, with the issuer-match check), the client-credentials, password,
-refresh-token and device (RFC 8628) flows, the parsers behind them, and a token cache with a refresh
+refresh-token and device (RFC 8628) flows, the browser flow (authorization code + PKCE with a
+loopback redirect, RFC 7636 / RFC 8252 - spec 003; opening the browser is the consumer's `present`
+callback), the parsers behind them, and a token cache with a refresh
 margin. Uses only the httplib and yyjson duckdb bundles, taken from the consumer's own duckdb tree;
 TLS comes from the consumer's build. From duckdb-acl spec 060, moved here by spec 002.
 
@@ -25,6 +27,7 @@ standalone tests of your own included.
 
 ```sh
 scripts/test_oidc.sh <duckdb source tree>       # the fake-IdP test, nothing of a built duckdb
+OIDC_TLS=1 scripts/test_oidc.sh <duckdb tree>   # the TLS variant consumers ship (system OpenSSL; OPENSSL_ROOT=...)
 CXX=clang++ scripts/fuzz_oidc.sh <duckdb tree>  # the parsers under libFuzzer (linux)
 ```
 

@@ -1,7 +1,8 @@
 // A test-only stand-in for duckdb's thin RegexMatch wrapper (src/common/re2_regex.cpp): the bundled
 // httplib parses status lines and query strings through it, and the real one reaches into duckdb's
 // exception machinery, which a duckdb-free test must not link. Same semantics over the same bundled
-// re2, minus the throws; a consumer links duckdb's own. Written for the 2.0 line (the throw helpers
+// re2, minus the throws; a consumer links duckdb's own. RegexFindAll is reached only by the TLS
+// variant (spec 003). Written for the 2.0 line (the throw helpers
 // below are its memory_safety.hpp); a sanitizer build keeps every one of these references alive.
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/helper.hpp"
@@ -49,12 +50,12 @@ Regex::Regex(const std::string &pattern, RegexOptions options) {
 }
 
 static bool SearchInternal(const char *input_data, size_t input_size, Match &match, const RE2 &regex,
-                           RE2::Anchor anchor) {
+                           RE2::Anchor anchor, size_t start = 0) {
 	std::vector<StringPiece> target_groups;
 	auto group_count = static_cast<size_t>(regex.NumberOfCapturingGroups() + 1);
 	target_groups.resize(group_count);
 	match.groups.clear();
-	if (!regex.Match(StringPiece(input_data, input_size), 0, input_size, anchor, target_groups.data(),
+	if (!regex.Match(StringPiece(input_data, input_size), start, input_size, anchor, target_groups.data(),
 	                 static_cast<int>(group_count))) {
 		return false;
 	}
@@ -82,6 +83,21 @@ bool RegexMatch(const char *start, const char *end, Match &match, const Regex &r
 bool RegexMatch(const std::string &input, const Regex &regex) {
 	Match nop_match;
 	return SearchInternal(input.c_str(), input.size(), nop_match, regex.GetRegex(), RE2::ANCHOR_BOTH);
+}
+
+// the TLS variant's httplib reaches it (digest authentication's header parsing): every
+// non-overlapping match, an empty match advancing one byte
+duckdb::vector<Match> RegexFindAll(const std::string &input, const Regex &regex) {
+	duckdb::vector<Match> matches;
+	size_t position = 0;
+	Match match;
+	while (position <= input.size() &&
+	       SearchInternal(input.c_str(), input.size(), match, regex.GetRegex(), RE2::UNANCHORED, position)) {
+		matches.emplace_back(match);
+		auto end = match.position(0) + match.length(0);
+		position = end > match.position(0) ? end : end + 1;
+	}
+	return matches;
 }
 
 } // namespace duckdb_re2

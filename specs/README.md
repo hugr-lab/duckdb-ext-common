@@ -20,3 +20,4 @@ Research and thinking-out-loud live in the local, gitignored `design/` folder.
 | --- | --- | --- |
 | [001](001-charter/spec.md) | the charter — what this repository is, and the rules everything in it follows | accepted |
 | [002](002-acl-migration/spec.md) | the duckdb-acl migration — the audit contract and the OIDC core arrive | implemented |
+| [003](003-oidc-auth-code/spec.md) | the OIDC core for people — authorization code + PKCE, loopback redirect; the TLS gate fixed | draft |

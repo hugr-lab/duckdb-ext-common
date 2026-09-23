@@ -20,8 +20,8 @@ Deeper research lives in the local, gitignored `design/` folder.
   directories they own.**
 - **R7/R8** — audit contracts never carry secrets, tokens, bearer handles, statement text or
   parameters; bounded metric attributes only; delivery never blocks the decision.
-- **R9** — headers compile against **both** duckdb lines in use (v1.5.5 and `v2.0-cyanoptera`); use only
-  API stable across them.
+- **R9** — headers compile against the duckdb line in use, today the 2.0 line (`v2.0-cyanoptera`) alone
+  (spec 003 amended the rule); use only API stable across the lines a header is compiled against.
 - **R10** — `oidc/` and future modules include nothing from `duckdb/` (bundled httplib/yyjson from the
   consumer's tree are fine) and ship their own tests.
 - **R13** — a module's namespace is the consumer's (`DUCKDB_EXT_COMMON_OIDC_NAMESPACE`, refused when
