@@ -28,7 +28,7 @@ as the node. Without them the node acts as a confused deputy.
 
 ## Design
 
-**Magic and version.** The magic is `ACLC` and `CONTRACT_VERSION` is 1. Both objects are stamped
+**Magic and version.** The magic is `ACLC` and `CONTRACT_VERSION` is 1 (2 since spec 007, the publisher mark). Both objects are stamped
 (R3): `AclConnection`, and `AclSessionHooks`, whose stamp sits after its vtable pointer like
 `AuditHooks`'s. The contract is independent of `ACLA` (R5). It shares `Principal`
 (`acl_principal.hpp`) with the audit contract, so a field added to `Principal` bumps both.
