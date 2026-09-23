@@ -84,11 +84,11 @@ from bounded sets — never per subject, object or secret name (those belong in 
 bounded queue; a consumer is called on a delivery thread. A slow or failing consumer costs a counted
 drop, never latency on a statement or a lookup.
 
-**R9. Every duckdb line a consumer builds on.** Headers compile against each duckdb line in use —
-today the **v1.5.5 release** (mssql-ducklake) and the **2.0 line** (`v2.0-cyanoptera` / `main`:
-duckdb-acl, acl-otel). CI checks both. A contract uses only duckdb API stable across those lines
-(`ObjectCacheEntry`, `ClientContextState`, basic types); when a line drops out of use, it drops out of
-CI.
+**R9. The duckdb line the consumers build on** (amended 2026-09-23, spec 003). Headers compile
+against the duckdb line in use — today the **2.0 line** (`v2.0-cyanoptera`: duckdb-acl, acl-otel,
+tresor), the owner's decision of 2026-09-18 (spec 002); CI checks it. A contract uses only duckdb API
+stable across the lines it is compiled against (`ObjectCacheEntry`, `ClientContextState`, basic
+types). A line that comes into use is added to CI with it; one that drops out of use drops out.
 
 **R10. duckdb-free modules stay duckdb-free.** A shared module may use the third-party headers duckdb
 bundles (httplib, yyjson) from the consumer's own duckdb tree, and TLS the consumer's build provides;

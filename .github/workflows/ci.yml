@@ -58,11 +58,12 @@ jobs:
         run: scripts/check_headers.sh /tmp/duckdb
 
   oidc:
-    name: OIDC core test (${{ matrix.os }})
+    name: OIDC core test (${{ matrix.os }}, tls=${{ matrix.tls }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
+        tls: ['0', '1']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -72,8 +73,14 @@ jobs:
             https://github.com/duckdb/duckdb /tmp/duckdb
           git -C /tmp/duckdb sparse-checkout set src/include third_party
       # the module, its test and the bundled third party from the tree - nothing of a built duckdb
+      # tls=1 is the variant every consumer ships (spec 003: its gate once tested a macro nobody
+      # defined, and only a TLS build shows that); the runner's OpenSSL - Homebrew's on macOS
       - name: The fake-IdP test
-        run: scripts/test_oidc.sh /tmp/duckdb build/oidc-test
+        env:
+          OIDC_TLS: ${{ matrix.tls }}
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then export OPENSSL_ROOT="$(brew --prefix openssl@3)"; fi
+          scripts/test_oidc.sh /tmp/duckdb build/oidc-test
 
   fuzz:
     name: Fuzz the OIDC parsers (clang, 60 s)
