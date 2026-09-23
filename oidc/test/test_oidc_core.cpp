@@ -419,6 +419,12 @@ int main() {
 		auto expired = AuthorizationCodeLogin(
 		    ep, "cli", "", [](const std::string &) {}, Now() - 1);
 		Check(!expired.Ok() && expired.error_code == "expired_token", "the deadline ends the wait");
+		LoopbackRedirect timed_out;
+		std::string receiver_error;
+		timed_out.Start(receiver_error);
+		timed_out.Expect("s");
+		timed_out.Wait(Now() - 1);
+		Check(timed_out.Wait(Now() + 30).error_code == "expired_token", "a second Wait reports the first one's end");
 		Endpoints machine_only = ep;
 		machine_only.authorization_endpoint.clear();
 		auto none = AuthorizationCodeLogin(
