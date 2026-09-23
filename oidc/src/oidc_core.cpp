@@ -14,6 +14,8 @@
 #include "httplib.hpp"
 
 #include "oidc_core.hpp"
+
+#include <cctype>
 #include "yyjson.hpp"
 
 #include <condition_variable>
@@ -344,6 +346,7 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 		out.access_token = json.Str("access_token");
 		out.refresh_token = json.Str("refresh_token");
 		out.issued_token_type = json.Str("issued_token_type");
+		out.token_type = json.Str("token_type");
 		auto expires_in = json.Int("expires_in");
 		static constexpr int64_t A_YEAR = int64_t(366) * 86400;
 		if (expires_in > A_YEAR) { // a year: past that the value is nonsense, and unclamped it
@@ -472,6 +475,15 @@ TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const 
 
 namespace {
 constexpr const char *ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
+constexpr const char *REFRESH_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:refresh_token";
+
+//! A credential the caller presented never reaches an error, even when the IdP quotes it back.
+void Redact(std::string &error, const std::string &presented) {
+	for (auto at = error.find(presented); !presented.empty() && at != std::string::npos;
+	     at = error.find(presented, at)) {
+		error.replace(at, presented.size(), "<redacted>");
+	}
+}
 
 TokenSet Refused(const std::string &code, const std::string &message) {
 	TokenSet refused;
@@ -481,21 +493,34 @@ TokenSet Refused(const std::string &code, const std::string &message) {
 }
 
 //! The end of every exchange (spec 004):
-//! - an answer that is not an access token (a refresh or ID token in its place) is refused, not used as one;
-//! - a refresh token is dropped: an exchanged token belongs to one session, and must not outlive it;
+//! - an answer that is not an access token (a refresh or ID token in its place) is refused, not used as one -
+//!   unless a refresh token was asked for (spec 006): then that type too, with an access token beside it;
+//! - a refresh token is dropped unless asked for: an exchanged token belongs to one session, and must not
+//!   outlive it - a caller that asks keeps it for that session only;
 //! - the presented token never reaches an error, even when the IdP quotes it back.
-TokenSet FinishExchange(TokenSet out, const std::string &presented) {
-	if (out.Ok() && !out.issued_token_type.empty() && out.issued_token_type != ACCESS_TOKEN_TYPE) {
+TokenSet FinishExchange(TokenSet out, const std::string &presented, bool with_refresh) {
+	auto type_ok = out.issued_token_type.empty() || out.issued_token_type == ACCESS_TOKEN_TYPE ||
+	               (with_refresh && out.issued_token_type == REFRESH_TOKEN_TYPE);
+	// RFC 8693's own marker for "what access_token holds is not an access token"
+	auto not_access = out.token_type.size() == 3 && std::tolower(out.token_type[0]) == 'n' &&
+	                  out.token_type[1] == '_' && std::tolower(out.token_type[2]) == 'a';
+	if (out.Ok() && (!type_ok || not_access)) {
 		return Refused("invalid_token_type", "the exchange answered with something other than an access token");
 	}
-	out.refresh_token.clear();
+	// a refresh-typed answer only in Keycloak's shape: an access token with a distinct refresh token beside it -
+	// never RFC 8693's strict shape, the refresh token itself in access_token
+	if (out.Ok() && out.issued_token_type == REFRESH_TOKEN_TYPE &&
+	    (out.refresh_token.empty() || out.refresh_token == out.access_token)) {
+		return Refused("invalid_token_type",
+		               "the exchange answered with a refresh token and no access token beside it");
+	}
+	if (!with_refresh || !out.Ok()) {
+		out.refresh_token.clear();
+	}
 	if (!out.Ok()) {
 		out.access_token.clear();
 		out.issued_token_type.clear();
-		for (auto at = out.error.find(presented); !presented.empty() && at != std::string::npos;
-		     at = out.error.find(presented, at)) {
-			out.error.replace(at, presented.size(), "<redacted>");
-		}
+		Redact(out.error, presented);
 	}
 	return out;
 }
@@ -503,7 +528,7 @@ TokenSet FinishExchange(TokenSet out, const std::string &presented) {
 
 TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &subject_token, const std::string &audience, const std::string &scope,
-                       const std::string &resource) {
+                       const std::string &resource, bool with_refresh) {
 	if (subject_token.empty()) {
 		return Refused("invalid_request", "token exchange: no subject token");
 	}
@@ -511,11 +536,12 @@ TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const 
 		// the IdP would answer with a token for every audience the client may reach
 		return Refused("invalid_request", "token exchange: no audience, resource or scope to exchange for");
 	}
-	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"},
-	                                           {"client_id", client_id},
-	                                           {"subject_token", subject_token},
-	                                           {"subject_token_type", ACCESS_TOKEN_TYPE},
-	                                           {"requested_token_type", ACCESS_TOKEN_TYPE}};
+	std::map<std::string, std::string> params {
+	    {"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"},
+	    {"client_id", client_id},
+	    {"subject_token", subject_token},
+	    {"subject_token_type", ACCESS_TOKEN_TYPE},
+	    {"requested_token_type", with_refresh ? REFRESH_TOKEN_TYPE : ACCESS_TOKEN_TYPE}};
 	if (!client_secret.empty()) {
 		params["client_secret"] = client_secret;
 	}
@@ -528,11 +554,11 @@ TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const 
 	if (!resource.empty()) {
 		params["resource"] = resource;
 	}
-	return FinishExchange(PostGrant(ep, params), subject_token);
+	return FinishExchange(PostGrant(ep, params), subject_token, with_refresh);
 }
 
 TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
-                    const std::string &assertion, const std::string &scope) {
+                    const std::string &assertion, const std::string &scope, bool with_refresh) {
 	if (assertion.empty() || scope.empty()) {
 		return Refused("invalid_request", "on-behalf-of: an assertion and a scope are required");
 	}
@@ -544,7 +570,7 @@ TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std
 	if (!client_secret.empty()) {
 		params["client_secret"] = client_secret;
 	}
-	return FinishExchange(PostGrant(ep, params), assertion);
+	return FinishExchange(PostGrant(ep, params), assertion, with_refresh);
 }
 
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
@@ -554,7 +580,11 @@ TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const s
 	if (!client_secret.empty()) {
 		params["client_secret"] = client_secret;
 	}
-	return PostGrant(ep, params);
+	auto out = PostGrant(ep, params);
+	if (!out.Ok()) {
+		Redact(out.error, refresh_token); // a refresh token lives long: never in an error either
+	}
+	return out;
 }
 
 DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope) {

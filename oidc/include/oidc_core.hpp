@@ -81,6 +81,7 @@ struct TokenSet {
 	std::string refresh_token;     // empty when the grant returns none
 	int64_t expires_at = 0;        // epoch seconds; 0 = the response carried no expiry
 	std::string issued_token_type; // RFC 8693's answer field; empty when the response carried none
+	std::string token_type;        // "Bearer", or RFC 8693's "N_A" for a token that is not an access token
 	std::string error;
 	std::string error_code;
 
@@ -102,15 +103,24 @@ TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const 
 //! presents `subject_token` - an access token it received - and asks the IdP for an access token for
 //! `audience` (and/or `resource`, `scope`; at least one). An answer that is not an access token is refused,
 //! a refresh token in the answer is dropped, and the subject token never appears in an error.
+//! `with_refresh` (spec 006) asks for a refresh token too (requested_token_type refresh_token - Keycloak's
+//! standard exchange issues one only so): the answer may then be typed as a refresh token, must still carry
+//! an access token, and keeps its refresh token for RefreshGrant. The IdP may refuse the type
+//! ("requested_token_type unsupported"): the caller decides whether to ask again without it. A
+//! refresh-typed answer is accepted only in Keycloak's shape - an access token and a distinct refresh token
+//! beside it; RFC 8693's strict shape (the refresh token itself in access_token, token_type N_A) is refused,
+//! so a refresh token is never taken for an access token. The flag may still succeed with no refresh token
+//! (an IdP that ignores it): an empty refresh_token means no renewal.
 TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &subject_token, const std::string &audience, const std::string &scope = "",
-                       const std::string &resource = "");
+                       const std::string &resource = "", bool with_refresh = false);
 
 //! Entra's On-Behalf-Of (RFC 7523 jwt-bearer, requested_token_use=on_behalf_of): `assertion` is the
 //! access token the client received, `scope` names the downstream API (api://.../.default). Both required;
-//! the answer is treated as TokenExchange's.
+//! the answer is treated as TokenExchange's. `with_refresh` keeps a refresh token Entra returns (it does when
+//! `scope` includes offline_access); without offline_access there is none - an empty refresh_token.
 TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
-                    const std::string &assertion, const std::string &scope);
+                    const std::string &assertion, const std::string &scope, bool with_refresh = false);
 
 //! grant_type=refresh_token — silent renewal off a previous TokenSet.
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
