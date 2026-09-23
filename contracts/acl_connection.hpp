@@ -64,7 +64,7 @@ namespace acl {
 //! The magic and version both objects of this contract are stamped with (R3).
 struct AclConnectionContract {
 	static constexpr int32_t MAGIC = 0x41434C43; // "ACLC"
-	static constexpr int32_t VERSION = 2;        // 1: spec 005 (acl 078); 2: spec 006 - the publisher mark
+	static constexpr int32_t VERSION = 2;        // 1: spec 005 (acl 078); 2: spec 007 - the publisher mark
 };
 
 //! A session as a statement runs under it. Never its handle: the handle is a bearer credential.
@@ -229,7 +229,7 @@ public:
 		return observers;
 	}
 
-	//! acl's, when it loads into the instance (spec 006): who publishes sessions here, e.g.
+	//! acl's, when it loads into the instance (spec 007): who publishes sessions here, e.g.
 	//! "duckdb-acl v2.0.0". Both sides GetOrCreate the registry, so without this mark a registry
 	//! nobody publishes into (acl not loaded, or older than the mark) looks like a node with no
 	//! session - and a consumer that acts for sessions would silently act as the node instead.
