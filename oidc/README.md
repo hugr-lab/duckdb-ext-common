@@ -5,7 +5,7 @@ R10): endpoint discovery (RFC 8414, with the issuer-match check), the client-cre
 refresh-token and device (RFC 8628) flows, the browser flow (authorization code + PKCE with a
 loopback redirect, RFC 7636 / RFC 8252 - spec 003; opening the browser is the consumer's `present`
 callback), token exchange (RFC 8693) and Entra's On-Behalf-Of for a server acting for a user
-(spec 004), the parsers behind them, and a token cache with a refresh
+(spec 004; with a refresh token when asked, spec 006), the parsers behind them, and a token cache with a refresh
 margin. Uses only the httplib and yyjson duckdb bundles, taken from the consumer's own duckdb tree;
 TLS comes from the consumer's build. From duckdb-acl spec 060, moved here by spec 002.
 
