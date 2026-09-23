@@ -343,6 +343,7 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 	if (response.Ok()) {
 		out.access_token = json.Str("access_token");
 		out.refresh_token = json.Str("refresh_token");
+		out.issued_token_type = json.Str("issued_token_type");
 		auto expires_in = json.Int("expires_in");
 		static constexpr int64_t A_YEAR = int64_t(366) * 86400;
 		if (expires_in > A_YEAR) { // a year: past that the value is nonsense, and unclamped it
@@ -354,8 +355,8 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 		}
 		return out;
 	}
-	out.error_code = json.Str("error");
-	auto description = json.Str("error_description");
+	out.error_code = Printable(json.Str("error").substr(0, 64));
+	auto description = Printable(json.Str("error_description"));
 	out.error = out.error_code.empty() ? ("HTTP " + std::to_string(response.status) + " from the token endpoint")
 	                                   : (out.error_code + (description.empty() ? "" : (": " + description)));
 	return out;
@@ -469,6 +470,83 @@ TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const 
 	return PostGrant(ep, params);
 }
 
+namespace {
+constexpr const char *ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
+
+TokenSet Refused(const std::string &code, const std::string &message) {
+	TokenSet refused;
+	refused.error_code = code;
+	refused.error = message;
+	return refused;
+}
+
+//! The end of every exchange (spec 004):
+//! - an answer that is not an access token (a refresh or ID token in its place) is refused, not used as one;
+//! - a refresh token is dropped: an exchanged token belongs to one session, and must not outlive it;
+//! - the presented token never reaches an error, even when the IdP quotes it back.
+TokenSet FinishExchange(TokenSet out, const std::string &presented) {
+	if (out.Ok() && !out.issued_token_type.empty() && out.issued_token_type != ACCESS_TOKEN_TYPE) {
+		return Refused("invalid_token_type", "the exchange answered with something other than an access token");
+	}
+	out.refresh_token.clear();
+	if (!out.Ok()) {
+		out.access_token.clear();
+		out.issued_token_type.clear();
+		for (auto at = out.error.find(presented); !presented.empty() && at != std::string::npos;
+		     at = out.error.find(presented, at)) {
+			out.error.replace(at, presented.size(), "<redacted>");
+		}
+	}
+	return out;
+}
+} // namespace
+
+TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                       const std::string &subject_token, const std::string &audience, const std::string &scope,
+                       const std::string &resource) {
+	if (subject_token.empty()) {
+		return Refused("invalid_request", "token exchange: no subject token");
+	}
+	if (audience.empty() && scope.empty() && resource.empty()) {
+		// the IdP would answer with a token for every audience the client may reach
+		return Refused("invalid_request", "token exchange: no audience, resource or scope to exchange for");
+	}
+	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"},
+	                                           {"client_id", client_id},
+	                                           {"subject_token", subject_token},
+	                                           {"subject_token_type", ACCESS_TOKEN_TYPE},
+	                                           {"requested_token_type", ACCESS_TOKEN_TYPE}};
+	if (!client_secret.empty()) {
+		params["client_secret"] = client_secret;
+	}
+	if (!audience.empty()) {
+		params["audience"] = audience;
+	}
+	if (!scope.empty()) {
+		params["scope"] = scope;
+	}
+	if (!resource.empty()) {
+		params["resource"] = resource;
+	}
+	return FinishExchange(PostGrant(ep, params), subject_token);
+}
+
+TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                    const std::string &assertion, const std::string &scope) {
+	if (assertion.empty() || scope.empty()) {
+		return Refused("invalid_request", "on-behalf-of: an assertion and a scope are required");
+	}
+	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+	                                           {"client_id", client_id},
+	                                           {"assertion", assertion},
+	                                           {"requested_token_use", "on_behalf_of"},
+	                                           {"scope", scope}};
+	if (!client_secret.empty()) {
+		params["client_secret"] = client_secret;
+	}
+	return FinishExchange(PostGrant(ep, params), assertion);
+}
+
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                       const std::string &refresh_token) {
 	std::map<std::string, std::string> params {
@@ -503,7 +581,7 @@ DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response) {
 		auto code = json.Str("error");
 		out.error = !response.error.empty() ? response.error
 		            : code.empty()          ? ("HTTP " + std::to_string(response.status))
-		                                    : (code + ": " + json.Str("error_description"));
+		                           : (Printable(code.substr(0, 64)) + ": " + Printable(json.Str("error_description")));
 		return out;
 	}
 	Json json(response.body);
