@@ -1,6 +1,6 @@
 # Spec 003: the OIDC core for people — authorization code + PKCE with a loopback redirect; the TLS gate fixed
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-09-23
 - **Author**: hugr lab (the tresor session)
 - **Consumer side**: tresor/specs/002-attach-login
