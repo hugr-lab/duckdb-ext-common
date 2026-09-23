@@ -15,6 +15,13 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include <string>
 #include <thread>
 
@@ -108,6 +115,15 @@ struct FakeIdp {
 				res.set_redirect(redirect_uri + "?code=ac-1&state=" + state);
 			}
 		});
+		// an echo for HttpSend: method, the Authorization header and the body come back
+		server.Put("/echo", [](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+			res.status = 201;
+			res.set_content(req.method + "|" + req.get_header_value("Authorization") + "|" +
+			                    req.get_header_value("Content-Type") + "|" + req.body,
+			                "text/plain");
+		});
+		server.Delete("/echo",
+		              [](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) { res.status = 204; });
 		server.Post("/device", [this](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
 			res.set_content("{\"device_code\":\"dc-1\",\"user_code\":\"WDJB-MJHT\",\"verification_uri\":\"" + Issuer() +
 			                    "/activate\",\"interval\":0,\"expires_in\":60}",
@@ -201,6 +217,34 @@ int Browse(const std::string &url) {
 	auto second = receiver.Get(back.substr(back_slash));
 	return second ? second->status : -1;
 }
+
+int64_t Now();
+
+//! Wait() on a receiver that was never started must refuse, not spin to the deadline.
+bool Wait0Receiver() {
+	LoopbackRedirect receiver;
+	auto result = receiver.Wait(Now() + 30);
+	return !result.Ok() && result.error_code == "invalid_request";
+}
+
+#ifndef _WIN32
+//! What a local attacker would try: bind the receiver's port with SO_REUSEPORT / SO_REUSEADDR.
+bool BindShared(int port) {
+	int sock = socket(AF_INET, SOCK_STREAM, 0);
+	int one = 1;
+	setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#ifdef SO_REUSEPORT
+	setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#endif
+	sockaddr_in addr {};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(uint16_t(port));
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	auto bound = bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0;
+	close(sock);
+	return bound;
+}
+#endif
 
 int64_t Now() {
 	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
@@ -312,8 +356,10 @@ int main() {
 		LoopbackRedirect receiver;
 		std::string error;
 		Check(receiver.Start(error), "the receiver binds: " + error);
+		Check(!receiver.Start(error), "a second Start is refused, not a second listener");
 		auto request = BuildAuthorizationRequest(ep, "cli", receiver.RedirectUri(), "openid");
 		Check(request.Ok() && request.verifier.size() == 43, "a request with a 43-char verifier");
+		receiver.Expect(request.state);
 		std::atomic<int> forged_status {0};
 		browser = std::thread([&] {
 			auto base = receiver.RedirectUri().substr(std::string("http://").size());
@@ -323,14 +369,47 @@ int main() {
 			forged_status = forged ? forged->status : -1;
 			Browse(request.url);
 		});
-		auto redirect = receiver.Wait(request.state, Now() + 30);
+		auto redirect = receiver.Wait(Now() + 30);
 		browser.join();
-		Check(forged_status == 400, "the forged callback is answered 400");
+		Check(forged_status == 400, "the forged callback (the state is expected, it is not it) is answered 400");
 		Check(redirect.Ok() && redirect.code == "ac-1", "the real callback's code, not the forged one");
+		auto again = receiver.Wait(Now() + 30);
+		Check(again.Ok() && again.code == "ac-1", "a second Wait reports the same end, it does not spin");
 		auto wrong = ExchangeAuthorizationCode(ep, "cli", redirect.code, RandomUrlSafe(32), request.redirect_uri);
 		Check(!wrong.Ok() && wrong.error_code == "invalid_grant", "a verifier that is not the challenge's is refused");
 		auto right = ExchangeAuthorizationCode(ep, "cli", redirect.code, request.verifier, request.redirect_uri);
 		Check(right.Ok(), "the right verifier is accepted: " + right.error);
+	});
+
+	Scenario("the browser flow: an IdP that redirects back at once, a port nobody may share", [&] {
+		// present() itself completes the round trip before Wait() is reached - an IdP with a live SSO
+		// session does exactly that (the review's race: the callback used to be refused for good)
+		int status = 0;
+		auto granted = AuthorizationCodeLogin(
+		    ep, "cli", "", [&](const std::string &url) { status = Browse(url); }, Now() + 10);
+		Check(status == 200, "the early callback is accepted, not answered 400");
+		Check(granted.Ok() && granted.access_token == "browser-token", "and the login completes: " + granted.error);
+		Check(Wait0Receiver(), "a Wait on a receiver never started refuses at once instead of spinning");
+#ifndef _WIN32
+		LoopbackRedirect receiver;
+		std::string error;
+		receiver.Start(error);
+		auto uri = receiver.RedirectUri();
+		auto port = std::stoi(uri.substr(std::string("http://127.0.0.1:").size()));
+		Check(!BindShared(port), "another socket cannot bind the receiver's port, SO_REUSEPORT or not");
+#endif
+	});
+
+	Scenario("HttpSend: any method, headers, a body", [&] {
+		auto put =
+		    HttpSend("PUT", idp.Issuer() + "/echo", {{"Authorization", "Bearer t-1"}}, "{\"a\":1}", "application/json");
+		Check(put.status == 201 && put.body == "PUT|Bearer t-1|application/json|{\"a\":1}",
+		      "the method, the header, the content type and the body arrive: " + put.body);
+		auto del = HttpSend("DELETE", idp.Issuer() + "/echo", {});
+		Check(del.status == 204 && del.error.empty(), "a bodyless DELETE");
+		auto get =
+		    HttpSend("GET", idp.Issuer() + "/.well-known/openid-configuration", {{"Accept", "application/json"}});
+		Check(get.Ok() && get.body.find("token_endpoint") != std::string::npos, "a GET");
 	});
 
 	Scenario("the browser flow: cancellation, the deadline, and the endpoints' checks", [&] {

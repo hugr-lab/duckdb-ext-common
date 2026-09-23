@@ -50,6 +50,11 @@ struct HttpResult {
 HttpResult HttpGet(const std::string &url, int timeout_seconds = 10);
 HttpResult HttpPostForm(const std::string &url, const std::map<std::string, std::string> &params,
                         int timeout_seconds = 30);
+//! Any method, with headers and an optional body: the transport a consumer's own REST calls ride
+//! (tresor's service API), so an image carries one TLS-compiled httplib, this module's (spec 003).
+HttpResult HttpSend(const std::string &method, const std::string &url,
+                    const std::map<std::string, std::string> &headers, const std::string &body = "",
+                    const std::string &content_type = "", int timeout_seconds = 30);
 
 //! The issuer's endpoints, discovered or assembled by the caller.
 struct Endpoints {
@@ -161,9 +166,10 @@ TokenSet ExchangeAuthorizationCode(const Endpoints &ep, const std::string &clien
                                    const std::string &verifier, const std::string &redirect_uri);
 
 //! The redirect receiver of a native client (RFC 8252 §7.3): an http server on 127.0.0.1, on a
-//! port the OS picks, that waits for the one `GET /callback` carrying the expected `state`. A
+//! port the OS picks and no other socket may share, that waits for the one `GET /callback` carrying
+//! the expected `state`. Until `Expect` names that state every callback is refused; afterwards a
 //! callback with another state is answered 400 and ignored - the wait goes on. Nothing from a
-//! request is reflected into the page the browser gets.
+//! request is reflected into the page the browser gets. One login per receiver.
 class LoopbackRedirect {
 public:
 	LoopbackRedirect();
@@ -171,24 +177,27 @@ public:
 	LoopbackRedirect(const LoopbackRedirect &) = delete;
 	LoopbackRedirect &operator=(const LoopbackRedirect &) = delete;
 
-	//! Binds and starts serving; false (with `error`) when no port could be bound.
+	//! Binds and starts serving; false (with `error`) when no port could be bound or it was started
+	//! before.
 	bool Start(std::string &error);
 	//! http://127.0.0.1:<port>/callback - valid after Start.
 	std::string RedirectUri() const;
+	//! The state this login sent. Call it BEFORE the browser is sent anywhere: a callback that lands
+	//! before it is refused, and a browser does not retry (the review's finding).
+	void Expect(const std::string &state);
 
 	struct Result {
 		std::string code;
 		std::string error;      // human-readable
-		std::string error_code; // the IdP's `error`, or expired_token / cancelled
+		std::string error_code; // the IdP's `error`, or expired_token / cancelled / invalid_request
 
 		bool Ok() const {
 			return error.empty() && !code.empty();
 		}
 	};
-	//! Until the matching callback, the deadline or the cancellation (checked every 200 ms). The
-	//! server is stopped on return.
-	Result Wait(const std::string &state, int64_t deadline_epoch_seconds,
-	            const std::function<bool()> &cancelled = nullptr);
+	//! Until the expected callback, the deadline or the cancellation (checked every 200 ms, outside the
+	//! lock the callback takes). The server is stopped on return; a second Wait reports the first's end.
+	Result Wait(int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled = nullptr);
 
 private:
 	struct Impl;

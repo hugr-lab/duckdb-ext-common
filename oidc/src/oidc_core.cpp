@@ -302,6 +302,16 @@ std::string Base64Url(const std::string &bytes) {
 	return out;
 }
 
+//! What the IdP's redirect says goes into an error message a consumer may print to a terminal:
+//! control characters out, and bounded.
+std::string Printable(const std::string &text) {
+	std::string out;
+	for (unsigned char c : text.substr(0, 512)) {
+		out.push_back(c < 0x20 || c == 0x7f ? '?' : char(c));
+	}
+	return out;
+}
+
 //! The page the browser lands on: fixed text, nothing from the request reflected into it.
 std::string CallbackPage(bool ok) {
 	return std::string("<!doctype html><html><head><meta charset=\"utf-8\"><title>Login</title></head><body>"
@@ -361,6 +371,27 @@ HttpResult HttpPostForm(const std::string &url, const std::map<std::string, std:
 	auto body = FormEncode(params);
 	return Run(parts, timeout_seconds, [&](auto &client) {
 		return client.Post(parts.path.c_str(), body, "application/x-www-form-urlencoded");
+	});
+}
+
+HttpResult HttpSend(const std::string &method, const std::string &url,
+                    const std::map<std::string, std::string> &headers, const std::string &body,
+                    const std::string &content_type, int timeout_seconds) {
+	auto parts = ParseUrl(url);
+	hl::Headers request_headers;
+	for (auto &header : headers) {
+		request_headers.emplace(header.first, header.second);
+	}
+	return Run(parts, timeout_seconds, [&](auto &client) {
+		hl::Request request;
+		request.method = method;
+		request.path = parts.path;
+		request.headers = request_headers;
+		if (!body.empty() || !content_type.empty()) {
+			request.body = body;
+			request.set_header("Content-Type", content_type.empty() ? "application/octet-stream" : content_type);
+		}
+		return client.send(request);
 	});
 }
 
@@ -543,7 +574,9 @@ std::string PkceChallenge(const std::string &verifier) {
 }
 
 std::string RandomUrlSafe(size_t bytes) {
-	std::random_device device; // the OS CSPRNG on every platform the consumers ship (spec 003)
+	// the OS CSPRNG on every platform the consumers ship (spec 003); it throws when the OS has no
+	// entropy source to give, and a login without randomness must fail rather than go on predictable
+	std::random_device device;
 	std::string raw;
 	raw.reserve(bytes);
 	while (raw.size() < bytes) {
@@ -596,6 +629,7 @@ struct LoopbackRedirect::Impl {
 	hl::Server server;
 	std::thread thread;
 	int port = 0;
+	bool started = false;
 	std::mutex mutex;
 	std::condition_variable arrived;
 	std::string expected_state;
@@ -619,7 +653,14 @@ LoopbackRedirect::~LoopbackRedirect() {
 
 bool LoopbackRedirect::Start(std::string &error) {
 	auto &state = *impl;
+	if (state.started) {
+		error = "the login redirect receiver was already started";
+		return false;
+	}
+	state.started = true;
 	state.server.Get("/callback", [&state](const hl::Request &req, hl::Response &res) {
+		res.set_header("Cache-Control", "no-store");
+		res.set_header("Connection", "close");
 		std::lock_guard<std::mutex> guard(state.mutex);
 		// only the request carrying the state this login sent completes it; anything else - a stray
 		// tab, a forged request from another local process - is refused and the wait goes on
@@ -631,10 +672,11 @@ bool LoopbackRedirect::Start(std::string &error) {
 		auto code = req.get_param_value("code");
 		auto idp_error = req.get_param_value("error");
 		if (!idp_error.empty() || code.empty()) {
-			state.result.error_code = idp_error.empty() ? "invalid_request" : idp_error;
-			auto description = req.get_param_value("error_description");
-			state.result.error = idp_error.empty() ? "the redirect carried neither a code nor an error"
-			                                       : (idp_error + (description.empty() ? "" : ": " + description));
+			state.result.error_code = idp_error.empty() ? "invalid_request" : Printable(idp_error);
+			auto description = Printable(req.get_param_value("error_description"));
+			state.result.error = idp_error.empty()
+			                         ? "the redirect carried neither a code nor an error"
+			                         : (state.result.error_code + (description.empty() ? "" : ": " + description));
 		} else {
 			state.result.code = code;
 		}
@@ -642,6 +684,22 @@ bool LoopbackRedirect::Start(std::string &error) {
 		res.set_content(CallbackPage(state.result.Ok()), "text/html; charset=utf-8");
 		state.arrived.notify_all();
 	});
+	// the port is this receiver's alone: httplib's default options set SO_REUSEPORT (SO_REUSEADDR on
+	// Windows), which would let another local socket bind the same port and take the callback (the
+	// review's finding). No sharing option at all; on Windows an exclusive bind besides.
+	state.server.set_socket_options([](socket_t sock) {
+#ifdef _WIN32
+		BOOL exclusive = TRUE;
+		setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char *>(&exclusive),
+		           sizeof(exclusive));
+#else
+		(void)sock;
+#endif
+	});
+	// a local process holding connections open must not hold the login (or its shutdown) for long
+	state.server.set_read_timeout(2, 0);
+	state.server.set_write_timeout(2, 0);
+	state.server.set_keep_alive_max_count(1);
 	// 127.0.0.1 exactly (RFC 8252 §7.3): never every interface, never a name that may resolve off-box
 	state.port = state.server.bind_to_any_port("127.0.0.1");
 	if (state.port <= 0) {
@@ -657,29 +715,51 @@ std::string LoopbackRedirect::RedirectUri() const {
 	return "http://127.0.0.1:" + std::to_string(impl->port) + "/callback";
 }
 
-LoopbackRedirect::Result LoopbackRedirect::Wait(const std::string &state, int64_t deadline_epoch_seconds,
+void LoopbackRedirect::Expect(const std::string &state) {
+	std::lock_guard<std::mutex> guard(impl->mutex);
+	impl->expected_state = state;
+}
+
+LoopbackRedirect::Result LoopbackRedirect::Wait(int64_t deadline_epoch_seconds,
                                                 const std::function<bool()> &cancelled) {
 	Result out;
-	{
-		std::unique_lock<std::mutex> lock(impl->mutex);
-		impl->expected_state = state;
-		while (!impl->done) {
-			if (cancelled && cancelled()) {
-				out.error = "login cancelled";
-				out.error_code = "cancelled";
+	if (!impl->started || impl->port <= 0) {
+		out.error = "the login redirect receiver is not running";
+		out.error_code = "invalid_request";
+		return out;
+	}
+	while (true) {
+		{
+			std::unique_lock<std::mutex> lock(impl->mutex);
+			if (impl->done) {
+				out = impl->result;
+				if (!out.Ok() && out.error.empty()) {
+					out.error = "the login redirect receiver was already used";
+					out.error_code = "invalid_request";
+				}
 				break;
 			}
 			if (NowSeconds() >= deadline_epoch_seconds) {
 				out.error = "the login timed out before the browser returned";
 				out.error_code = "expired_token";
+				impl->done = true; // late callbacks are refused from here on
 				break;
 			}
 			impl->arrived.wait_for(lock, std::chrono::milliseconds(200));
+			if (impl->done) {
+				continue;
+			}
 		}
-		if (impl->done) {
-			out = impl->result;
+		// the caller's check runs outside the lock the callback handler takes
+		if (cancelled && cancelled()) {
+			std::lock_guard<std::mutex> guard(impl->mutex);
+			if (!impl->done) {
+				out.error = "login cancelled";
+				out.error_code = "cancelled";
+				impl->done = true;
+				break;
+			}
 		}
-		impl->done = true; // late callbacks are refused from here on
 	}
 	impl->Stop();
 	return out;
@@ -689,6 +769,12 @@ TokenSet AuthorizationCodeLogin(const Endpoints &ep, const std::string &client_i
                                 const std::function<void(const std::string &url)> &present,
                                 int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled) {
 	TokenSet out;
+	// the endpoints first: no port is bound for an issuer that has no browser flow
+	auto checked = BuildAuthorizationRequest(ep, client_id, "http://127.0.0.1/callback", scope);
+	if (!checked.Ok()) {
+		out.error = checked.error;
+		return out;
+	}
 	LoopbackRedirect receiver;
 	std::string error;
 	if (!receiver.Start(error)) {
@@ -700,10 +786,11 @@ TokenSet AuthorizationCodeLogin(const Endpoints &ep, const std::string &client_i
 		out.error = request.error;
 		return out;
 	}
+	receiver.Expect(request.state); // before the browser: the IdP may redirect back at once (SSO)
 	if (present) {
 		present(request.url);
 	}
-	auto redirect = receiver.Wait(request.state, deadline_epoch_seconds, cancelled);
+	auto redirect = receiver.Wait(deadline_epoch_seconds, cancelled);
 	if (!redirect.Ok()) {
 		out.error = redirect.error;
 		out.error_code = redirect.error_code;

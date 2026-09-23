@@ -47,17 +47,26 @@ New in `oidc_core.hpp`, all duckdb-free (R10):
   `state`. SHA-256 is a small implementation inside the module's TU (no crypto library: the module
   must build without OpenSSL, and the test does); the randomness is `std::random_device`, which is
   the OS CSPRNG on every platform the consumers ship (libc++/libstdc++ read `getrandom`/`/dev/urandom`,
-  MSVC `rand_s`).
+  MSVC `rand_s`, MinGW's libstdc++ since GCC 9.2).
 - `LoopbackRedirect` — the redirect receiver (pimpl: no httplib in the header). `Start()` binds the
   bundled httplib server to **`127.0.0.1` on a port the OS picks** (RFC 8252 §7.3; never `0.0.0.0`,
-  never `localhost`, which may resolve off-box), `RedirectUri()` is `http://127.0.0.1:<port>/callback`.
-  `Wait(state, deadline, cancelled)` returns the first `GET /callback` whose `state` matches: the
-  `code`, or the IdP's `error`/`error_description`. A callback with a wrong or missing `state` is
-  answered 400 and **ignored** — the wait continues (a stray or forged request neither completes nor
-  aborts the login). The browser gets a short fixed page ("login complete / failed — you can close
-  this window"); nothing from the request is reflected into it. The wait checks the cancellation
-  and the deadline in slices of 200 ms; the server is stopped and joined on return and in the
-  destructor.
+  never `localhost`, which may resolve off-box). The port is **not shareable**: httplib's default
+  socket options (`SO_REUSEPORT`, or `SO_REUSEADDR` on Windows) are replaced by none, plus
+  `SO_EXCLUSIVEADDRUSE` on Windows, so no other local socket can bind the port and take the callback.
+  Reads and writes time out after 2 s and connections are not kept alive, so a local process holding
+  connections open cannot hold the login or its shutdown for long. `RedirectUri()` is
+  `http://127.0.0.1:<port>/callback`. **`Expect(state)` comes before the browser is sent anywhere**:
+  an IdP with a live session redirects back at once, and a browser does not retry a refused callback.
+  Until `Expect` names the state, every callback is refused. `Wait(deadline, cancelled)` returns the
+  first `GET /callback` whose `state` matches: the `code`, or the IdP's `error`/`error_description`
+  (control characters replaced, 512 characters at most, since consumers print it). A callback with a
+  wrong or missing `state` is answered 400 and **ignored**, and the wait continues: a stray or forged
+  request neither completes nor aborts the login. The browser gets a short fixed page ("login
+  complete / failed — you can close this window", `Cache-Control: no-store`), and nothing from the
+  request is reflected into it. The wait checks the deadline every 200 ms and the cancellation
+  between those slices, outside the lock the callback handler takes. The server is stopped and joined
+  on return and in the destructor. Misuse is refused rather than undefined: a second `Start` fails, a
+  `Wait` without `Start` returns at once, and a second `Wait` reports the first one's outcome.
 - `BuildAuthorizationRequest(ep, client_id, redirect_uri, scope)` → `{url, state, verifier}`:
   `response_type=code`, `client_id`, `redirect_uri`, `scope`, `state`, `code_challenge`,
   `code_challenge_method=S256`. An endpoint that already has a query string is appended to with `&`.
@@ -65,10 +74,18 @@ New in `oidc_core.hpp`, all duckdb-free (R10):
   `grant_type=authorization_code` with the `code_verifier` and the same `redirect_uri`; a public
   client, so no secret.
 - `AuthorizationCodeLogin(ep, client_id, scope, present, deadline, cancelled)` — the whole flow:
-  start the receiver, build the request, hand the URL to `present` (the consumer prints it and opens
+  check the endpoints (no port is bound for an issuer without the browser flow), start the receiver,
+  build the request, `Expect` its state, hand the URL to `present` (the consumer prints it and opens
   a browser — spawning processes is the consumer's business, not a duckdb-free module's), wait,
   exchange. Errors come back in `TokenSet::error` / `error_code` like every other flow
   (`access_denied`, `expired_token` for the deadline, `cancelled`).
+
+### HttpSend — the consumer's own REST calls
+
+`HttpSend(method, url, headers, body, content_type, timeout)`: any method, with headers. tresor
+calls its service's API (`Authorization: Bearer`) with it, so an image carries exactly one
+TLS-compiled httplib TU, this module's (the single-TU discipline of spec 002). Same transport rules as
+the flows: https only in a TLS build, certificates verified, the transport error string on failure.
 
 What the module does **not** do: open a browser, pick between the browser and the device flow, keep
 tokens anywhere but the existing in-memory `TokenCache`. Those are consumer policy.
@@ -110,7 +127,27 @@ additive, acl's call sites compile unchanged. Checked against `v2.0-cyanoptera`.
 - **A fixed redirect port** — collides with whatever else listens; RFC 8252 §7.3 requires that any
   port be accepted by the IdP, which Keycloak, Entra and Okta do for loopback redirect URIs.
 
+## The review's findings (applied)
+
+An independent review of the first commit, with the races reproduced:
+
+- **An early callback was refused for good.** The expected state was set only in `Wait`, so an
+  IdP that redirected back before `Wait` (a live SSO session, a slow `present`) got a 400, and the
+  login ran into its deadline. Fixed by `Expect` before `present`.
+- **The port could be shared.** httplib's default `SO_REUSEPORT` let a second local socket bind the
+  port and receive the callback. PKCE keeps the code from being redeemed, but the attacker could still
+  block the login or answer in its place. Fixed by setting no sharing option, plus
+  `SO_EXCLUSIVEADDRUSE` on Windows.
+- **Connections could be held open.** Short timeouts and no keep-alive; the cancellation is checked
+  outside the lock; misuse of the receiver is refused; `error_description` is sanitized;
+  `Cache-Control: no-store` on the page; the endpoints are checked before a port is bound.
+- `std::random_device` throws when the OS has no entropy source. The exception propagates, because a
+  login must not go on with predictable values. MinGW's libstdc++ has used the OS CSPRNG since GCC 9.2.
+
 ## Follow-ups
+
+- RFC 9207 (`iss` in the authorization response): with one IdP per fresh port and state the mix-up it
+  prevents cannot happen here. Check it when a client talks to several IdPs at once.
 
 - `private_key_jwt` (RFC 7523), federated assertions (Kubernetes projected tokens, GitHub OIDC) and
   the Azure sources from mssql-extension (IMDS, workload identity) — the rest of the charter's
