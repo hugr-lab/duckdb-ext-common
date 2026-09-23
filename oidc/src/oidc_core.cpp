@@ -14,6 +14,8 @@
 #include "httplib.hpp"
 
 #include "oidc_core.hpp"
+
+#include <cctype>
 #include "yyjson.hpp"
 
 #include <condition_variable>
@@ -344,6 +346,7 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 		out.access_token = json.Str("access_token");
 		out.refresh_token = json.Str("refresh_token");
 		out.issued_token_type = json.Str("issued_token_type");
+		out.token_type = json.Str("token_type");
 		auto expires_in = json.Int("expires_in");
 		static constexpr int64_t A_YEAR = int64_t(366) * 86400;
 		if (expires_in > A_YEAR) { // a year: past that the value is nonsense, and unclamped it
@@ -474,6 +477,14 @@ namespace {
 constexpr const char *ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token";
 constexpr const char *REFRESH_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:refresh_token";
 
+//! A credential the caller presented never reaches an error, even when the IdP quotes it back.
+void Redact(std::string &error, const std::string &presented) {
+	for (auto at = error.find(presented); !presented.empty() && at != std::string::npos;
+	     at = error.find(presented, at)) {
+		error.replace(at, presented.size(), "<redacted>");
+	}
+}
+
 TokenSet Refused(const std::string &code, const std::string &message) {
 	TokenSet refused;
 	refused.error_code = code;
@@ -490,8 +501,18 @@ TokenSet Refused(const std::string &code, const std::string &message) {
 TokenSet FinishExchange(TokenSet out, const std::string &presented, bool with_refresh) {
 	auto type_ok = out.issued_token_type.empty() || out.issued_token_type == ACCESS_TOKEN_TYPE ||
 	               (with_refresh && out.issued_token_type == REFRESH_TOKEN_TYPE);
-	if (out.Ok() && !type_ok) {
+	// RFC 8693's own marker for "what access_token holds is not an access token"
+	auto not_access = out.token_type.size() == 3 && std::tolower(out.token_type[0]) == 'n' &&
+	                  out.token_type[1] == '_' && std::tolower(out.token_type[2]) == 'a';
+	if (out.Ok() && (!type_ok || not_access)) {
 		return Refused("invalid_token_type", "the exchange answered with something other than an access token");
+	}
+	// a refresh-typed answer only in Keycloak's shape: an access token with a distinct refresh token beside it -
+	// never RFC 8693's strict shape, the refresh token itself in access_token
+	if (out.Ok() && out.issued_token_type == REFRESH_TOKEN_TYPE &&
+	    (out.refresh_token.empty() || out.refresh_token == out.access_token)) {
+		return Refused("invalid_token_type",
+		               "the exchange answered with a refresh token and no access token beside it");
 	}
 	if (!with_refresh || !out.Ok()) {
 		out.refresh_token.clear();
@@ -499,10 +520,7 @@ TokenSet FinishExchange(TokenSet out, const std::string &presented, bool with_re
 	if (!out.Ok()) {
 		out.access_token.clear();
 		out.issued_token_type.clear();
-		for (auto at = out.error.find(presented); !presented.empty() && at != std::string::npos;
-		     at = out.error.find(presented, at)) {
-			out.error.replace(at, presented.size(), "<redacted>");
-		}
+		Redact(out.error, presented);
 	}
 	return out;
 }
@@ -562,7 +580,11 @@ TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const s
 	if (!client_secret.empty()) {
 		params["client_secret"] = client_secret;
 	}
-	return PostGrant(ep, params);
+	auto out = PostGrant(ep, params);
+	if (!out.Ok()) {
+		Redact(out.error, refresh_token); // a refresh token lives long: never in an error either
+	}
+	return out;
 }
 
 DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope) {

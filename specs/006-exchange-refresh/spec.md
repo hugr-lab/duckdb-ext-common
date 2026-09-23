@@ -36,6 +36,13 @@ TokenSet OnBehalfOf(ep, client_id, client_secret, assertion, scope, bool with_re
 - **An IdP that will not issue a refresh token by exchange** answers with its own error. Keycloak's
   is `invalid_request: requested_token_type unsupported`. The caller decides whether to ask again
   without the flag.
+- **Only in Keycloak's shape.** A refresh-typed answer must have an access token *and* a distinct
+  refresh token beside it. RFC 8693's strict shape puts the refresh token itself in `access_token`
+  (`token_type: N_A`), and a refresh token must never be taken for an access token, so that shape is
+  refused, as is any `token_type: N_A` on every exchange.
+- **The flag may succeed without a refresh token,** from an IdP that ignores it, or OBO without
+  `offline_access`. An empty `refresh_token` means no renewal. The caller also learns that a refresh
+  token has died only when `RefreshGrant` fails (`invalid_grant`): `refresh_expires_in` is not carried.
 - **Without the flag** nothing changes. Only an access token is accepted, any refresh token is
   dropped, and a refresh-typed answer is refused.
 - A refresh token is a credential like any other: it never appears in an error, and the caller keeps
@@ -55,6 +62,15 @@ Keycloak refuses with `requested_token_type unsupported`.
 
 A module change; the defaults keep every existing call as it was. No contract changes: `ACLA` 2 and
 `ACLC` 1 stay. Ships as **v0.5.0**.
+
+## The review's findings (applied)
+
+- **The strict RFC shape was accepted with the flag.** A refresh token alone in `access_token` would
+  have been handed on as a bearer token. It is refused now, as is `token_type: N_A`.
+- **`RefreshGrant` did not redact the presented refresh token** from an IdP's error. It does now,
+  with the same helper as the exchange.
+- **Smaller fixes:** OBO's refresh behaviour (kept or dropped) is tested; weak assertions were
+  replaced; the empty-refresh case is documented.
 
 ## Testing
 

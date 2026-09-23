@@ -160,6 +160,8 @@ struct FakeIdp {
 			if (grant == "refresh_token") {
 				if (req.get_param_value("refresh_token") == "rt-1") {
 					res.set_content("{\"access_token\":\"pw-token-2\",\"expires_in\":60}", "application/json");
+				} else if (req.get_param_value("refresh_token") == "rt-quote-me") {
+					deny("invalid_grant", "refresh token rt-quote-me is not active");
 				} else {
 					deny("invalid_grant", "unknown refresh token");
 				}
@@ -188,8 +190,19 @@ struct FakeIdp {
 				           req.get_param_value("requested_token_type") ==
 				               "urn:ietf:params:oauth:token-type:refresh_token") {
 					// Keycloak's standard exchange: a refresh token only when asked for, the answer typed so
+					auto rt = std::string("urn:ietf:params:oauth:token-type:refresh_token");
 					if (req.get_param_value("audience") == "no-refresh-here") {
 						deny("invalid_request", "requested_token_type unsupported");
+					} else if (req.get_param_value("audience") == "strict-rfc") {
+						// RFC 8693's strict shape: the refresh token itself in access_token
+						res.set_content("{\"access_token\":\"rt-only\",\"issued_token_type\":\"" + rt +
+						                    "\",\"token_type\":\"N_A\"}",
+						                "application/json");
+					} else if (req.get_param_value("audience") == "same-twice") {
+						res.set_content("{\"access_token\":\"rt-twice\",\"refresh_token\":\"rt-twice\","
+						                "\"issued_token_type\":\"" +
+						                    rt + "\"}",
+						                "application/json");
 					} else {
 						res.set_content("{\"access_token\":\"exchanged-with-refresh\",\"refresh_token\":\"rt-x\","
 						                "\"expires_in\":300,\"issued_token_type\":"
@@ -235,8 +248,9 @@ struct FakeIdp {
 				    req.get_param_value("client_secret") != "node-secret") {
 					deny("invalid_grant", "AADSTS50013: the assertion is not valid");
 				} else {
-					res.set_content("{\"access_token\":\"obo-for-" + req.get_param_value("scope") +
-					                    "\",\"expires_in\":300}",
+					auto offline = req.get_param_value("scope").find("offline_access") != std::string::npos;
+					res.set_content("{\"access_token\":\"obo-for-" + req.get_param_value("scope") + "\"," +
+					                    (offline ? "\"refresh_token\":\"rt-obo\"," : "") + "\"expires_in\":300}",
 					                "application/json");
 				}
 				return;
@@ -593,8 +607,22 @@ int main() {
 		    TokenExchange(ep, "node", "node-secret", "user-token-for-node", "no-refresh-here", "", "", true);
 		Check(!unsupported.Ok() && unsupported.error_code == "invalid_request" && unsupported.refresh_token.empty(),
 		      "an IdP that does not issue refresh tokens by exchange says so: " + unsupported.error);
-		// without it, the same answer type is still refused and no refresh token survives
-		Check(!refusals[3].Ok() && refusals[3].refresh_token.empty(), "not asked: a refresh-typed answer is refused");
+		// RFC 8693's strict shape - the refresh token itself in access_token - is never taken for an access token
+		for (auto aud : {"strict-rfc", "same-twice"}) {
+			auto strict = TokenExchange(ep, "node", "node-secret", "user-token-for-node", aud, "", "", true);
+			Check(!strict.Ok() && strict.error_code == "invalid_token_type" && strict.access_token.empty() &&
+			          strict.refresh_token.empty() && strict.error.find("rt-") == std::string::npos,
+			      std::string("a refresh token alone is refused (") + aud + "): " + strict.error);
+		}
+		// after flagged calls, an unflagged one is as before: a refresh-typed answer refused, nothing kept
+		auto after = TokenExchange(ep, "node", "node-secret", "user-token-for-node", "hand-me-a-refresh-token");
+		Check(!after.Ok() && after.error_code == "invalid_token_type" && after.refresh_token.empty(),
+		      "not asked: a refresh-typed answer is refused");
+		// a refresh token quoted back by the IdP is redacted from RefreshGrant's error too
+		auto quoted = RefreshGrant(ep, "node", "node-secret", "rt-quote-me");
+		Check(!quoted.Ok() && quoted.error.find("rt-quote-me") == std::string::npos &&
+		          quoted.error.find("<redacted>") != std::string::npos,
+		      "RefreshGrant redacts the presented refresh token: " + quoted.error);
 		auto obo = OnBehalfOf(ep, "node", "node-secret", "user-token-for-node", "api://secrets/.default");
 		Check(obo.Ok() && obo.access_token == "obo-for-api://secrets/.default", "On-Behalf-Of: " + obo.error);
 		{
@@ -604,6 +632,13 @@ int main() {
 			          idp.last_exchange["assertion"] == "user-token-for-node",
 			      "the On-Behalf-Of request as Entra wants it");
 		}
+		auto obo_kept =
+		    OnBehalfOf(ep, "node", "node-secret", "user-token-for-node", "api://x/.default offline_access", true);
+		auto obo_dropped =
+		    OnBehalfOf(ep, "node", "node-secret", "user-token-for-node", "api://x/.default offline_access");
+		Check(obo_kept.Ok() && obo_kept.refresh_token == "rt-obo" && obo_dropped.Ok() &&
+		          obo_dropped.refresh_token.empty(),
+		      "On-Behalf-Of: Entra's refresh token kept with the flag, dropped without it");
 		Check(OnBehalfOf(ep, "node", "node-secret", "user-token-for-node", "").error_code == "invalid_request" &&
 		          OnBehalfOf(ep, "node", "node-secret", "", "api://x/.default").error_code == "invalid_request",
 		      "On-Behalf-Of without a scope or an assertion: refused before any request");
