@@ -9,6 +9,9 @@ Shared code for the hugr-lab DuckDB extensions — what several of them need and
   counters and gauges.
 - **`oidc/`** — the OIDC client core (discovery, token flows, token cache), duckdb-free, compiled into
   each consumer.
+- **`keychain/`** — one small secret in the operating system's credential store (macOS Keychain,
+  Windows Credential Manager, the Linux Secret Service), duckdb-free, compiled into each consumer;
+  never a file.
 
 Consumers today and soon: [duckdb-acl](https://github.com/hugr-lab/duckdb-acl),
 [acl-otel](https://github.com/hugr-lab/acl-otel), tresor (secrets-service client), mirror (ingest),
@@ -36,7 +39,7 @@ git -C duckdb-ext-common checkout <tag>
 include_directories(duckdb-ext-common/hooks duckdb-ext-common/contracts)
 ```
 
-A module (`oidc/`) is consumed through `oidc/oidc.cmake` — a list of sources and an include dir the
+A module (`oidc/`, `keychain/`) is consumed through its `.cmake` file (`oidc/oidc.cmake`) — a list of sources and an include dir the
 consumer compiles into itself under a namespace it names; see [oidc/README.md](oidc/README.md).
 
 ## The rules, in short

@@ -32,7 +32,7 @@ jobs:
           /tmp/cf/bin/pip install clang_format==11.0.1
       - name: clang-format check
         run: |
-          files="$(find hooks contracts oidc \( -name '*.hpp' -o -name '*.cpp' \) 2>/dev/null)"
+          files="$(find hooks contracts oidc keychain \( -name '*.hpp' -o -name '*.cpp' \) 2>/dev/null)"
           if [ -z "$files" ]; then echo "no sources yet"; exit 0; fi
           echo "$files" | xargs /tmp/cf/bin/clang-format --dry-run --Werror
       - name: yamllint
@@ -99,3 +99,38 @@ jobs:
       # pre-authentication network input
       - name: libFuzzer over the parsers
         run: CXX=clang++ FUZZ_SECONDS=60 scripts/fuzz_oidc.sh /tmp/duckdb build/oidc-fuzz
+
+  keychain:
+    name: Keychain module (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      # spec 010: the real OS store on each platform - Linux's Secret Service is gnome-keyring on a
+      # private session bus, macOS a throwaway keychain made the default, Windows the runner's
+      # Credential Manager (MinGW's g++, which the runner carries)
+      - name: Linux - gnome-keyring on a session bus, and no bus at all
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libsecret-1-0 gnome-keyring dbus-x11
+          env -u DBUS_SESSION_BUS_ADDRESS KEYCHAIN_EXPECT_UNAVAILABLE=1 scripts/test_keychain.sh build/kc-none
+          dbus-run-session -- bash -c \
+            'echo -n ci | gnome-keyring-daemon --unlock --components=secrets >/dev/null; scripts/test_keychain.sh'
+      - name: macOS - a throwaway default keychain
+        if: runner.os == 'macOS'
+        run: |
+          security create-keychain -p ci ci.keychain
+          security unlock-keychain -p ci ci.keychain
+          security default-keychain -s ci.keychain
+          security list-keychains -d user -s ci.keychain
+          scripts/test_keychain.sh
+          security delete-keychain ci.keychain
+      - name: Windows - the Credential Manager
+        if: runner.os == 'Windows'
+        run: CXX=g++ scripts/test_keychain.sh
