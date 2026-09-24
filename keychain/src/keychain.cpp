@@ -304,6 +304,10 @@ bool Target(const std::string &service, const std::string &account, std::wstring
 	return true;
 }
 
+//! The Credential Manager's limit on a credential's blob since Vista (the SDK's CRED_MAX_CREDENTIAL_BLOB_SIZE,
+//! 5 * 512): MinGW's headers still carry the old 512, so the module names it itself.
+constexpr size_t MAX_BLOB_BYTES = 5 * 512;
+
 std::string LastError(const char *what) {
 	auto code = GetLastError();
 	if (code == ERROR_NO_SUCH_LOGON_SESSION) {
@@ -332,8 +336,8 @@ KeychainResult KeychainStore(const std::string &service, const std::string &acco
 	if (!Target(service, account, target, why) || !SecretOk(secret, why)) {
 		return Failed(why);
 	}
-	if (secret.size() > CRED_MAX_CREDENTIAL_BLOB_SIZE) {
-		return Failed("the Windows Credential Manager holds at most " + std::to_string(CRED_MAX_CREDENTIAL_BLOB_SIZE) +
+	if (secret.size() > MAX_BLOB_BYTES) {
+		return Failed("the Windows Credential Manager holds at most " + std::to_string(MAX_BLOB_BYTES) +
 		              " bytes per credential");
 	}
 	std::wstring user;

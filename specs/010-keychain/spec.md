@@ -84,8 +84,9 @@ KeychainResult KeychainRemove(const std::string &service, const std::string &acc
   - The consumer links `-framework Security -framework CoreFoundation`.
 - **Windows:** a `CRED_TYPE_GENERIC` credential with target `service/account`,
   `CRED_PERSIST_LOCAL_MACHINE` (the user's profile on this machine, not roaming). Links `advapi32`.
-  - A credential holds at most `CRED_MAX_CREDENTIAL_BLOB_SIZE` (2560) bytes; a longer secret is
-    refused with that reason.
+  - A credential holds at most 2560 bytes (the SDK's `CRED_MAX_CREDENTIAL_BLOB_SIZE`; MinGW's
+    headers still say 512, so the module names the limit itself). A longer secret is refused
+    with that reason.
   - `KeychainAvailable` asks `CredGetSessionTypes`: a service logon, a network logon or an SSH
     public-key logon has no credential set, and reads as unavailable.
 - **Linux:**
@@ -143,8 +144,8 @@ KeychainResult KeychainRemove(const std::string &service, const std::string &acc
   - macOS CI: a temporary keychain made the default for the test (`security create-keychain`,
     `default-keychain`), deleted after.
   - Windows CI: the runner's Credential Manager.
-- Linux without a Secret Service (`DBUS_SESSION_BUS_ADDRESS` unset): not available, with why, and
-  no crash.
+- Linux without a session bus (`DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR` unset): not
+  available, with why, and no crash.
 - A Linux locked collection (locked over D-Bus in CI): nothing handed out, in well under the watchdog.
 - On every platform, the test also checks that these are refused, and that no error carries the
   secret:
