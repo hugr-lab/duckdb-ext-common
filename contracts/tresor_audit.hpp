@@ -19,6 +19,9 @@
 // bounded reason code, and on an acl node the session's ops id and the statement's trace context - so a
 // consumer puts tresor's work in the trace of the statement that caused it.
 //
+// A sink runs on tresor's delivery thread, and last at the instance's end, inside the ObjectCache's teardown:
+// it must not reach the ObjectCache (or anything in it) from OnEvent or Flush.
+//
 // Owned by tresor (R6). Bump VERSION on any change to what this header lays out, the base included (R4).
 //===----------------------------------------------------------------------===//
 
@@ -34,7 +37,8 @@ namespace tresor {
 //! kinds (bounded): login, logout, lookup, refresh, write, drop, annotate, grant, revoke,
 //!                  session_grant (a delegation grant for an acl session: detail = obtained / failed /
 //!                  revoked / rejected / expired)
-//! outcome (bounded): ok, none (a lookup found nothing here), denied, error
+//! outcome (bounded): ok, none (nothing to do: an IF [NOT] EXISTS write or drop that changed nothing), denied,
+//!                  error
 //! reason_code (bounded, on denied/error): no_verb, not_found, actor_not_allowed, mint_refused,
 //!                  unauthenticated, service_unavailable, transport, invalid, no_grant, other
 struct TresorAuditEvent {

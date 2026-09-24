@@ -74,7 +74,7 @@ copy it; the charter planned a shared base in `hooks/` for exactly this.
 | --- | --- |
 | `ts_us`, `seq` | when it ended; per-instance order |
 | `kind` | login, logout, lookup, refresh, write, drop, annotate, grant, revoke, session_grant |
-| `outcome` | ok, none (a lookup found nothing here), denied, error |
+| `outcome` | ok, none (an IF [NOT] EXISTS write or drop that changed nothing), denied, error |
 | `reason_code`, `reason` | on denied/error: no_verb, not_found, actor_not_allowed, mint_refused, unauthenticated, service_unavailable, transport, invalid, no_grant, other; `reason` is composed from tresor's fixed texts and names only, never an exception's text or the service's or IdP's answer |
 | `service`, `host`, `login` | the attached catalog, the service it names, the login flow |
 | `principal`, `user` | the attachment's login subject; under an acl session, the session's user |
@@ -86,6 +86,8 @@ copy it; the charter planned a shared base in `hooks/` for exactly this.
 
 - **No per-session trace.** An event joins the trace of its statement (`traceparent`); a consumer
   makes its span a child of that. A session-wide trace is a later version, if ever.
+- **A sink never reaches the ObjectCache** from `OnEvent` or `Flush`: the last delivery runs inside
+  its teardown.
 - **Nobody listening, nothing composed.** A producer checks `HasSinks()` (and its own log's level)
   before it builds an event.
 - **Metrics:** `tresor.events` {kind, outcome, cached} counts every event. A lookup served from
