@@ -56,6 +56,9 @@ jobs:
         run: diff <(tail -n +2 .clang-format) /tmp/duckdb/.clang-format
       - name: Every header compiles on its own
         run: scripts/check_headers.sh /tmp/duckdb
+      # the delivery queue, counters and gauges every contract is built on (spec 008), on their own
+      - name: The hooks test
+        run: scripts/test_hooks.sh /tmp/duckdb build/hooks-test
 
   oidc:
     name: OIDC core test (${{ matrix.os }}, tls=${{ matrix.tls }})

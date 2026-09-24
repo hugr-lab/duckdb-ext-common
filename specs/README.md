@@ -25,3 +25,4 @@ Research and thinking-out-loud live in the local, gitignored `design/` folder.
 | [005](005-acl-connection/spec.md) | the acl_connection contract — whose session a statement runs under, and session open/close | implemented |
 | [006](006-exchange-refresh/spec.md) | token exchange that keeps a refresh token, when asked (`with_refresh`) | implemented |
 | [007](007-publisher-mark/spec.md) | the publisher mark - a consumer can tell acl is publishing sessions (`ACLC` 2) | implemented |
+| [008](008-hooks-tresor-audit/spec.md) | the hooks base and tresor's audit contract (`TRSA` 1) | implemented |
