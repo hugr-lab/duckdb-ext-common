@@ -137,6 +137,8 @@ jobs:
           security list-keychains -d user -s ci.keychain
           scripts/test_keychain.sh
           security delete-keychain ci.keychain
+          # the default now names a deleted keychain: unavailable, said so - never the system's dialog
+          KEYCHAIN_EXPECT_UNAVAILABLE=1 build/keychain-test/test_keychain
       - name: Windows - the Credential Manager
         if: runner.os == 'Windows'
         run: CXX=g++ scripts/test_keychain.sh

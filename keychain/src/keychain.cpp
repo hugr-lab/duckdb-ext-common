@@ -178,7 +178,22 @@ CFMutableDictionaryRef Query(const std::string &service, const std::string &acco
 } // namespace
 
 bool KeychainAvailable(std::string &why) {
-	// a lookup that finds nothing proves a default keychain answers without asking anyone
+	// no default keychain (a daemon's session; a default that points at a deleted file): an add would have the
+	// system ask the person, in a dialog, to create one - never from here. The call is deprecated, and the only
+	// one that tells
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	SecKeychainRef keychain = nullptr;
+	auto has_default = SecKeychainCopyDefault(&keychain);
+	if (keychain) {
+		CFRelease(keychain);
+	}
+#pragma clang diagnostic pop
+	if (has_default != errSecSuccess) {
+		why = "the macOS keychain: no default keychain in this session";
+		return false;
+	}
+	// a lookup that finds nothing proves the keychain answers without asking anyone
 	CF query(Query("org.duckdb.ext-common.probe", ""));
 	if (!query.ref) {
 		why = "the macOS keychain could not be queried";
@@ -196,7 +211,7 @@ bool KeychainAvailable(std::string &why) {
 
 KeychainResult KeychainStore(const std::string &service, const std::string &account, const std::string &secret) {
 	std::string why;
-	if (!NamesOk(service, account, why) || !SecretOk(secret, why)) {
+	if (!NamesOk(service, account, why) || !SecretOk(secret, why) || !KeychainAvailable(why)) {
 		return Failed(why);
 	}
 	CF query(Query(service, account));

@@ -77,8 +77,10 @@ KeychainResult KeychainRemove(const std::string &service, const std::string &acc
     upgrade (a new cdhash), gets the system's "wants to use your confidential information" dialog.
     Over SSH that dialog cannot show, and the call fails with `errSecInteractionNotAllowed`, which
     the module reports as "locked, or asks the user and cannot here".
-  - `KeychainAvailable` probes with a lookup, so no default keychain (a launchd daemon, some SSH
-    sessions) reads as unavailable.
+  - `KeychainAvailable` asks for the default keychain and then probes with a lookup. No default
+    keychain (a launchd daemon, a default that names a deleted file) reads as unavailable. An add
+    there would have the system ask the person, in a "Keychain Not Found" dialog, to create one.
+    `KeychainStore` checks this first.
   - The consumer links `-framework Security -framework CoreFoundation`.
 - **Windows:** a `CRED_TYPE_GENERIC` credential with target `service/account`,
   `CRED_PERSIST_LOCAL_MACHINE` (the user's profile on this machine, not roaming). Links `advapi32`.
