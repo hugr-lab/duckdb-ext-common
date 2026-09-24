@@ -19,8 +19,18 @@
 #include "yyjson.hpp"
 
 #include <condition_variable>
+#include <cstdlib>
 #include <random>
 #include <thread>
+
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+#include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/ecdsa.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#endif
 
 #ifdef DUCKDB_EXT_COMMON_OIDC_TLS
 namespace hl = duckdb_httplib_openssl;
@@ -461,6 +471,324 @@ TokenSet ClientCredentials(const Endpoints &ep, const std::string &client_id, co
 	return PostGrant(ep, params);
 }
 
+namespace {
+
+void Redact(std::string &error, const std::string &presented); // below, with the exchanges
+
+//! A string as JSON text.
+std::string JsonQuote(const std::string &text) {
+	std::string out = "\"";
+	for (unsigned char c : text) {
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		default:
+			if (c < 0x20) {
+				char buffer[8];
+				snprintf(buffer, sizeof(buffer), "\\u%04x", c);
+				out += buffer;
+			} else {
+				out += char(c);
+			}
+		}
+	}
+	return out + "\"";
+}
+
+void WipeString(std::string &text) {
+	volatile char *bytes = text.empty() ? nullptr : &text[0];
+	for (size_t i = 0; i < text.size(); i++) {
+		bytes[i] = 0;
+	}
+	text.clear();
+}
+
+//! The client's proof in a grant's form: an assertion (signed here, for this endpoint, or a federated one as
+//! is), or the secret. False with `error` when a key cannot sign.
+bool AddClientAuth(std::map<std::string, std::string> &params, const Endpoints &ep, const ClientAuth &auth,
+                   std::string &error) {
+	params["client_id"] = auth.client_id;
+	std::string assertion = auth.assertion;
+	if (!auth.private_key_pem.empty()) {
+		auto signed_assertion = SignClientAssertion(auth.client_id, ep.token_endpoint, auth.private_key_pem,
+		                                            auth.key_id, auth.certificate_pem);
+		if (!signed_assertion.error.empty()) {
+			error = signed_assertion.error;
+			return false;
+		}
+		assertion = std::move(signed_assertion.jwt);
+	}
+	if (!assertion.empty()) {
+		params["client_assertion_type"] = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+		params["client_assertion"] = std::move(assertion);
+	} else if (!auth.client_secret.empty()) {
+		params["client_secret"] = auth.client_secret;
+	}
+	return true;
+}
+
+//! A platform endpoint: loopback or link-local only (an environment variable must not redirect a request that
+//! carries an identity header).
+bool LocalEndpoint(const std::string &url) {
+	auto parts = ParseUrl(url);
+	if (!parts.error.empty()) {
+		return false;
+	}
+	auto &host = parts.host;
+	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]" ||
+	       host.rfind("169.254.", 0) == 0;
+}
+
+//! A platform's token answer: access_token, and expires_in / expires_on as a number or a string (Azure sends
+//! strings).
+TokenSet ParsePlatformToken(const HttpResult &response, const std::string &source) {
+	TokenSet out;
+	if (!response.error.empty()) {
+		out.error = source + ": " + response.error;
+		out.error_code = "unreachable";
+		return out;
+	}
+	Json json(response.body);
+	if (!response.Ok()) {
+		auto code = Printable(json.Str("error").substr(0, 64));
+		auto description = Printable(json.Str("error_description"));
+		out.error_code = code;
+		out.error = source + " answered HTTP " + std::to_string(response.status) + (code.empty() ? "" : ": " + code) +
+		            (description.empty() ? "" : " - " + description);
+		return out;
+	}
+	out.access_token = json.Str("access_token");
+	if (out.access_token.empty()) {
+		out.access_token = json.Str("value"); // GitHub's id-token answer
+	}
+	auto number = [&](const char *key) -> int64_t {
+		auto as_int = json.Int(key);
+		if (as_int > 0) {
+			return as_int;
+		}
+		auto as_text = json.Str(key);
+		return as_text.empty() ? 0 : std::strtoll(as_text.c_str(), nullptr, 10);
+	};
+	auto expires_in = number("expires_in");
+	auto expires_on = number("expires_on");
+	if (expires_in > 0 && expires_in < int64_t(366) * 86400) {
+		out.expires_at = NowSeconds() + expires_in;
+	} else if (expires_on > NowSeconds()) {
+		out.expires_at = expires_on;
+	}
+	if (out.access_token.empty()) {
+		out.error = source + " answered without a token";
+	}
+	return out;
+}
+
+} // namespace
+
+SignedAssertion SignClientAssertion(const std::string &client_id, const std::string &audience,
+                                    const std::string &private_key_pem, const std::string &key_id,
+                                    const std::string &certificate_pem) {
+	SignedAssertion out;
+#ifndef DUCKDB_EXT_COMMON_OIDC_TLS
+	(void)client_id;
+	(void)audience;
+	(void)private_key_pem;
+	(void)key_id;
+	(void)certificate_pem;
+	out.error = "a signed client assertion needs a TLS-enabled build (DUCKDB_EXT_COMMON_OIDC_TLS)";
+	return out;
+#else
+	if (client_id.empty() || audience.empty()) {
+		out.error = "a client assertion needs a client id and an audience";
+		return out;
+	}
+	// no passphrase: an encrypted key is refused (a prompt on the terminal is never the answer here)
+	auto no_passphrase = [](char *, int, int, void *) -> int {
+		return 0;
+	};
+	std::unique_ptr<BIO, decltype(&BIO_free)> key_bio(
+	    BIO_new_mem_buf(private_key_pem.data(), int(private_key_pem.size())), BIO_free);
+	std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(
+	    key_bio ? PEM_read_bio_PrivateKey(key_bio.get(), nullptr, no_passphrase, nullptr) : nullptr, EVP_PKEY_free);
+	if (!key) {
+		out.error = "the private key is not an unencrypted PEM key";
+		return out;
+	}
+	std::string alg;
+	auto type = EVP_PKEY_base_id(key.get());
+	if (type == EVP_PKEY_RSA) {
+		if (EVP_PKEY_bits(key.get()) < 2048) {
+			out.error = "the RSA key is shorter than 2048 bits";
+			return out;
+		}
+		alg = "RS256";
+	} else if (type == EVP_PKEY_EC && EVP_PKEY_bits(key.get()) == 256) {
+		alg = "ES256";
+	} else {
+		out.error = "the private key is neither RSA nor EC P-256";
+		return out;
+	}
+	std::string header = "{\"alg\":\"" + alg + "\",\"typ\":\"JWT\"";
+	if (!key_id.empty()) {
+		header += ",\"kid\":" + JsonQuote(key_id);
+	}
+	if (!certificate_pem.empty()) {
+		std::unique_ptr<BIO, decltype(&BIO_free)> cert_bio(
+		    BIO_new_mem_buf(certificate_pem.data(), int(certificate_pem.size())), BIO_free);
+		std::unique_ptr<X509, decltype(&X509_free)> cert(
+		    cert_bio ? PEM_read_bio_X509(cert_bio.get(), nullptr, nullptr, nullptr) : nullptr, X509_free);
+		if (!cert) {
+			out.error = "the certificate is not a PEM certificate";
+			return out;
+		}
+		unsigned char *der = nullptr;
+		auto der_size = i2d_X509(cert.get(), &der);
+		if (der_size <= 0) {
+			out.error = "the certificate could not be encoded";
+			return out;
+		}
+		unsigned char sha1[EVP_MAX_MD_SIZE];
+		unsigned int sha1_size = 0;
+		unsigned char sha256[EVP_MAX_MD_SIZE];
+		unsigned int sha256_size = 0;
+		EVP_Digest(der, size_t(der_size), sha1, &sha1_size, EVP_sha1(), nullptr);
+		EVP_Digest(der, size_t(der_size), sha256, &sha256_size, EVP_sha256(), nullptr);
+		OPENSSL_free(der);
+		// x5t: SHA-1 of the DER, which Entra matches certificates by; x5t#S256 for everyone else
+		header += ",\"x5t\":\"" + Base64Url(std::string(reinterpret_cast<char *>(sha1), sha1_size)) + "\"";
+		header += ",\"x5t#S256\":\"" + Base64Url(std::string(reinterpret_cast<char *>(sha256), sha256_size)) + "\"";
+	}
+	header += "}";
+	auto now = NowSeconds();
+	std::string payload = "{\"iss\":" + JsonQuote(client_id) + ",\"sub\":" + JsonQuote(client_id) +
+	                      ",\"aud\":" + JsonQuote(audience) + ",\"jti\":\"" + RandomUrlSafe(18) +
+	                      "\",\"iat\":" + std::to_string(now) + ",\"nbf\":" + std::to_string(now) +
+	                      ",\"exp\":" + std::to_string(now + 60) + "}";
+	auto input = Base64Url(header) + "." + Base64Url(payload);
+	std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+	size_t signature_size = 0;
+	if (!ctx || EVP_DigestSignInit(ctx.get(), nullptr, EVP_sha256(), nullptr, key.get()) != 1 ||
+	    EVP_DigestSign(ctx.get(), nullptr, &signature_size, reinterpret_cast<const unsigned char *>(input.data()),
+	                   input.size()) != 1) {
+		out.error = "signing the client assertion failed";
+		return out;
+	}
+	std::string signature(signature_size, '\0');
+	if (EVP_DigestSign(ctx.get(), reinterpret_cast<unsigned char *>(&signature[0]), &signature_size,
+	                   reinterpret_cast<const unsigned char *>(input.data()), input.size()) != 1) {
+		out.error = "signing the client assertion failed";
+		return out;
+	}
+	signature.resize(signature_size);
+	if (alg == "ES256") {
+		// JWS wants r || s, 32 bytes each; OpenSSL gives a DER ECDSA-Sig-Value
+		auto der = reinterpret_cast<const unsigned char *>(signature.data());
+		std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)> sig(d2i_ECDSA_SIG(nullptr, &der, long(signature.size())),
+		                                                          ECDSA_SIG_free);
+		if (!sig) {
+			out.error = "signing the client assertion failed";
+			return out;
+		}
+		const BIGNUM *r = nullptr;
+		const BIGNUM *s = nullptr;
+		ECDSA_SIG_get0(sig.get(), &r, &s);
+		std::string raw(64, '\0');
+		BN_bn2binpad(r, reinterpret_cast<unsigned char *>(&raw[0]), 32);
+		BN_bn2binpad(s, reinterpret_cast<unsigned char *>(&raw[32]), 32);
+		signature = raw;
+	}
+	out.jwt = input + "." + Base64Url(signature);
+	return out;
+#endif
+}
+
+TokenSet ClientCredentials(const Endpoints &ep, const ClientAuth &auth, const std::string &scope,
+                           const std::map<std::string, std::string> &extra) {
+	std::map<std::string, std::string> params {{"grant_type", "client_credentials"}};
+	std::string error;
+	if (!AddClientAuth(params, ep, auth, error)) {
+		TokenSet refused;
+		refused.error = error;
+		refused.error_code = "invalid_client";
+		return refused;
+	}
+	if (!scope.empty()) {
+		params["scope"] = scope;
+	}
+	for (auto &param : extra) {
+		params.emplace(param.first, param.second);
+	}
+	auto out = PostGrant(ep, params);
+	if (!out.Ok()) {
+		Redact(out.error, params["client_assertion"]);
+		Redact(out.error, auth.client_secret);
+	}
+	WipeString(params["client_assertion"]);
+	return out;
+}
+
+TokenSet ManagedIdentityToken(const ManagedIdentity &identity, int timeout_seconds) {
+	TokenSet out;
+	if (identity.resource.empty()) {
+		out.error = "managed identity: no resource to ask a token for";
+		return out;
+	}
+	auto endpoint = std::getenv("IDENTITY_ENDPOINT");
+	auto secret = std::getenv("IDENTITY_HEADER");
+	if (endpoint && *endpoint && secret && *secret) {
+		// App Service, Functions, Container Apps: the platform's local endpoint, and its header
+		if (!LocalEndpoint(endpoint)) {
+			out.error = "managed identity: IDENTITY_ENDPOINT is not a loopback or link-local address - refused";
+			return out;
+		}
+		std::map<std::string, std::string> query {{"api-version", "2019-08-01"}, {"resource", identity.resource}};
+		if (!identity.client_id.empty()) {
+			query["client_id"] = identity.client_id;
+		}
+		auto url = std::string(endpoint) + (std::string(endpoint).find('?') == std::string::npos ? "?" : "&") +
+		           FormEncode(query);
+		return ParsePlatformToken(HttpSend("GET", url, {{"X-IDENTITY-HEADER", secret}}, "", "", timeout_seconds),
+		                          "the managed identity endpoint");
+	}
+	if (!LocalEndpoint(identity.imds)) {
+		out.error = "managed identity: the instance metadata endpoint must be loopback or link-local";
+		return out;
+	}
+	std::map<std::string, std::string> query {{"api-version", "2018-02-01"}, {"resource", identity.resource}};
+	if (!identity.client_id.empty()) {
+		query["client_id"] = identity.client_id;
+	}
+	return ParsePlatformToken(HttpSend("GET", identity.imds + "/metadata/identity/oauth2/token?" + FormEncode(query),
+	                                   {{"Metadata", "true"}}, "", "", timeout_seconds),
+	                          "the Azure instance metadata service");
+}
+
+TokenSet GithubActionsToken(const std::string &audience, int timeout_seconds) {
+	TokenSet out;
+	auto url = std::getenv("ACTIONS_ID_TOKEN_REQUEST_URL");
+	auto bearer = std::getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+	if (!url || !*url || !bearer || !*bearer) {
+		out.error = "GitHub Actions: no id token here (the job needs `permissions: id-token: write`)";
+		return out;
+	}
+	std::string request_url = url;
+	if (request_url.rfind("https://", 0) != 0 && !LocalEndpoint(request_url)) {
+		out.error = "GitHub Actions: ACTIONS_ID_TOKEN_REQUEST_URL is neither https nor loopback - refused";
+		return out;
+	}
+	if (!audience.empty()) {
+		request_url += (request_url.find('?') == std::string::npos ? "?" : "&") + FormEncode({{"audience", audience}});
+	}
+	out = ParsePlatformToken(
+	    HttpSend("GET", request_url, {{"Authorization", std::string("bearer ") + bearer}}, "", "", timeout_seconds),
+	    "GitHub Actions' token service");
+	Redact(out.error, bearer);
+	return out;
+}
+
 TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &username, const std::string &password, const std::string &scope) {
 	std::map<std::string, std::string> params {
@@ -530,6 +858,15 @@ TokenSet FinishExchange(TokenSet out, const std::string &presented, bool with_re
 TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &subject_token, const std::string &audience, const std::string &scope,
                        const std::string &resource, bool with_refresh) {
+	ClientAuth auth;
+	auth.client_id = client_id;
+	auth.client_secret = client_secret;
+	return TokenExchange(ep, auth, subject_token, audience, scope, resource, with_refresh);
+}
+
+TokenSet TokenExchange(const Endpoints &ep, const ClientAuth &auth, const std::string &subject_token,
+                       const std::string &audience, const std::string &scope, const std::string &resource,
+                       bool with_refresh) {
 	if (subject_token.empty()) {
 		return Refused("invalid_request", "token exchange: no subject token");
 	}
@@ -539,12 +876,12 @@ TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const 
 	}
 	std::map<std::string, std::string> params {
 	    {"grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"},
-	    {"client_id", client_id},
 	    {"subject_token", subject_token},
 	    {"subject_token_type", ACCESS_TOKEN_TYPE},
 	    {"requested_token_type", with_refresh ? REFRESH_TOKEN_TYPE : ACCESS_TOKEN_TYPE}};
-	if (!client_secret.empty()) {
-		params["client_secret"] = client_secret;
+	std::string error;
+	if (!AddClientAuth(params, ep, auth, error)) {
+		return Refused("invalid_client", error);
 	}
 	if (!audience.empty()) {
 		params["audience"] = audience;
@@ -555,23 +892,37 @@ TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const 
 	if (!resource.empty()) {
 		params["resource"] = resource;
 	}
-	return FinishExchange(PostGrant(ep, params), subject_token, with_refresh);
+	auto out = FinishExchange(PostGrant(ep, params), subject_token, with_refresh);
+	Redact(out.error, params["client_assertion"]);
+	WipeString(params["client_assertion"]);
+	return out;
 }
 
 TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                     const std::string &assertion, const std::string &scope, bool with_refresh) {
+	ClientAuth auth;
+	auth.client_id = client_id;
+	auth.client_secret = client_secret;
+	return OnBehalfOf(ep, auth, assertion, scope, with_refresh);
+}
+
+TokenSet OnBehalfOf(const Endpoints &ep, const ClientAuth &auth, const std::string &assertion, const std::string &scope,
+                    bool with_refresh) {
 	if (assertion.empty() || scope.empty()) {
 		return Refused("invalid_request", "on-behalf-of: an assertion and a scope are required");
 	}
 	std::map<std::string, std::string> params {{"grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
-	                                           {"client_id", client_id},
 	                                           {"assertion", assertion},
 	                                           {"requested_token_use", "on_behalf_of"},
 	                                           {"scope", scope}};
-	if (!client_secret.empty()) {
-		params["client_secret"] = client_secret;
+	std::string error;
+	if (!AddClientAuth(params, ep, auth, error)) {
+		return Refused("invalid_client", error);
 	}
-	return FinishExchange(PostGrant(ep, params), assertion, with_refresh);
+	auto out = FinishExchange(PostGrant(ep, params), assertion, with_refresh);
+	Redact(out.error, params["client_assertion"]);
+	WipeString(params["client_assertion"]);
+	return out;
 }
 
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
@@ -624,7 +975,8 @@ RevokeResult Revoke(const Endpoints &ep, const std::string &client_id, const std
 	return out;
 }
 
-DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope) {
+DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope,
+                                const std::map<std::string, std::string> &extra) {
 	DeviceAuthorization out;
 	if (!ep.Ok()) {
 		out.error = ep.error.empty() ? "no endpoints" : ep.error;
@@ -637,6 +989,9 @@ DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_i
 	std::map<std::string, std::string> params {{"client_id", client_id}};
 	if (!scope.empty()) {
 		params["scope"] = scope;
+	}
+	for (auto &param : extra) {
+		params.emplace(param.first, param.second);
 	}
 	return ParseDeviceAuthorization(HttpPostForm(ep.device_authorization_endpoint, params));
 }
@@ -734,7 +1089,8 @@ std::string RandomUrlSafe(size_t bytes) {
 }
 
 AuthorizationRequest BuildAuthorizationRequest(const Endpoints &ep, const std::string &client_id,
-                                               const std::string &redirect_uri, const std::string &scope) {
+                                               const std::string &redirect_uri, const std::string &scope,
+                                               const std::map<std::string, std::string> &extra) {
 	AuthorizationRequest out;
 	if (!ep.Ok()) {
 		out.error = ep.error.empty() ? "no endpoints" : ep.error;
@@ -755,6 +1111,9 @@ AuthorizationRequest BuildAuthorizationRequest(const Endpoints &ep, const std::s
 	                                           {"code_challenge_method", "S256"}};
 	if (!scope.empty()) {
 		params["scope"] = scope;
+	}
+	for (auto &param : extra) {
+		params.emplace(param.first, param.second); // never over the flow's own parameters
 	}
 	auto separator = ep.authorization_endpoint.find('?') == std::string::npos ? "?" : "&";
 	out.url = ep.authorization_endpoint + separator + FormEncode(params);
@@ -914,10 +1273,11 @@ LoopbackRedirect::Result LoopbackRedirect::Wait(int64_t deadline_epoch_seconds,
 
 TokenSet AuthorizationCodeLogin(const Endpoints &ep, const std::string &client_id, const std::string &scope,
                                 const std::function<void(const std::string &url)> &present,
-                                int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled) {
+                                int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled,
+                                const std::map<std::string, std::string> &extra) {
 	TokenSet out;
 	// the endpoints first: no port is bound for an issuer that has no browser flow
-	auto checked = BuildAuthorizationRequest(ep, client_id, "http://127.0.0.1/callback", scope);
+	auto checked = BuildAuthorizationRequest(ep, client_id, "http://127.0.0.1/callback", scope, extra);
 	if (!checked.Ok()) {
 		out.error = checked.error;
 		return out;
@@ -928,7 +1288,7 @@ TokenSet AuthorizationCodeLogin(const Endpoints &ep, const std::string &client_i
 		out.error = error;
 		return out;
 	}
-	auto request = BuildAuthorizationRequest(ep, client_id, receiver.RedirectUri(), scope);
+	auto request = BuildAuthorizationRequest(ep, client_id, receiver.RedirectUri(), scope, extra);
 	if (!request.Ok()) {
 		out.error = request.error;
 		return out;

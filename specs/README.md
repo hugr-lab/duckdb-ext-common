@@ -29,3 +29,4 @@ Research and thinking-out-loud live in the local, gitignored `design/` folder.
 | [009](009-audit-gauges-under-lock/spec.md) | the audit gauges read under their lock (no layout change, ACLA stays 2) | implemented |
 | [010](010-keychain/spec.md) | the keychain module — a credential in the operating system's own store | implemented |
 | [011](011-oidc-revocation-scope/spec.md) | the OIDC core revokes (RFC 7009), and refreshes for another scope | implemented |
+| [012](012-oidc-service-identities/spec.md) | the OIDC core for services without a shared secret — private_key_jwt, federated assertions, Azure managed identity, an audience parameter | implemented |

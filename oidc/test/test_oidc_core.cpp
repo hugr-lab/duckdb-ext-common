@@ -24,12 +24,163 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
+#include <cstdlib>
+#include <set>
 #include <string>
 #include <thread>
+
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+#include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/ecdsa.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#endif
 
 using namespace duckdb::DUCKDB_EXT_COMMON_OIDC_NAMESPACE::oidc;
 
 namespace {
+
+int64_t Now() {
+	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+	    .count();
+}
+
+std::string B64UrlDecode(const std::string &in) {
+	std::string out;
+	int buffer = 0;
+	int bits = 0;
+	for (char c : in) {
+		int v;
+		if (c >= 'A' && c <= 'Z') {
+			v = c - 'A';
+		} else if (c >= 'a' && c <= 'z') {
+			v = c - 'a' + 26;
+		} else if (c >= '0' && c <= '9') {
+			v = c - '0' + 52;
+		} else if (c == '-') {
+			v = 62;
+		} else if (c == '_') {
+			v = 63;
+		} else {
+			break;
+		}
+		buffer = (buffer << 6) | v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push_back(char((buffer >> bits) & 0xff));
+		}
+	}
+	return out;
+}
+
+//! "key":"value" or "key":number out of flat JSON - enough for a test's own assertions.
+std::string JsonField(const std::string &json, const std::string &key) {
+	auto at = json.find("\"" + key + "\":");
+	if (at == std::string::npos) {
+		return "";
+	}
+	at += key.size() + 3;
+	if (json[at] == '"') {
+		auto end = json.find('"', at + 1);
+		return json.substr(at + 1, end - at - 1);
+	}
+	auto end = json.find_first_of(",}", at);
+	return json.substr(at, end - at);
+}
+
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+std::string Pem(EVP_PKEY *key, bool with_private, const char *passphrase = nullptr) {
+	std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new(BIO_s_mem()), BIO_free);
+	if (with_private) {
+		PEM_write_bio_PrivateKey(bio.get(), key, passphrase ? EVP_aes_256_cbc() : nullptr,
+		                         reinterpret_cast<unsigned char *>(const_cast<char *>(passphrase)),
+		                         passphrase ? int(strlen(passphrase)) : 0, nullptr, nullptr);
+	} else {
+		PEM_write_bio_PUBKEY(bio.get(), key);
+	}
+	char *data = nullptr;
+	auto size = BIO_get_mem_data(bio.get(), &data);
+	return std::string(data, size_t(size));
+}
+
+//! A self-signed certificate for `key`, and the base64url SHA-256 of its DER (what x5t#S256 must say).
+std::string SelfSigned(EVP_PKEY *key, std::string &thumbprint) {
+	std::unique_ptr<X509, decltype(&X509_free)> cert(X509_new(), X509_free);
+	ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1);
+	X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
+	X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3600);
+	X509_set_pubkey(cert.get(), key);
+	auto name = X509_get_subject_name(cert.get());
+	X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>("node"), -1, -1, 0);
+	X509_set_issuer_name(cert.get(), name);
+	X509_sign(cert.get(), key, EVP_sha256());
+	unsigned char *der = nullptr;
+	auto size = i2d_X509(cert.get(), &der);
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int digest_size = 0;
+	EVP_Digest(der, size_t(size), digest, &digest_size, EVP_sha256(), nullptr);
+	OPENSSL_free(der);
+	std::string raw(reinterpret_cast<char *>(digest), digest_size);
+	// the core's own base64url, through a PKCE challenge of nothing would not do: encode here
+	static const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	thumbprint.clear();
+	int buffer = 0, bits = 0;
+	for (unsigned char c : raw) {
+		buffer = (buffer << 8) | c;
+		bits += 8;
+		while (bits >= 6) {
+			bits -= 6;
+			thumbprint.push_back(alphabet[(buffer >> bits) & 0x3f]);
+		}
+	}
+	if (bits > 0) {
+		thumbprint.push_back(alphabet[(buffer << (6 - bits)) & 0x3f]);
+	}
+	std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new(BIO_s_mem()), BIO_free);
+	PEM_write_bio_X509(bio.get(), cert.get());
+	char *data = nullptr;
+	auto pem_size = BIO_get_mem_data(bio.get(), &data);
+	return std::string(data, size_t(pem_size));
+}
+
+//! A JWS checked against a public key: RS256 or ES256 (r||s). The header and payload JSON when it verifies.
+bool VerifyJwt(const std::string &jwt, const std::string &public_pem, std::string &header, std::string &payload) {
+	auto first = jwt.find('.');
+	auto second = jwt.find('.', first + 1);
+	if (first == std::string::npos || second == std::string::npos) {
+		return false;
+	}
+	header = B64UrlDecode(jwt.substr(0, first));
+	payload = B64UrlDecode(jwt.substr(first + 1, second - first - 1));
+	auto signature = B64UrlDecode(jwt.substr(second + 1));
+	std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new_mem_buf(public_pem.data(), int(public_pem.size())), BIO_free);
+	std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> key(PEM_read_bio_PUBKEY(bio.get(), nullptr, nullptr, nullptr),
+	                                                        EVP_PKEY_free);
+	if (!key) {
+		return false;
+	}
+	if (JsonField(header, "alg") == "ES256") {
+		if (signature.size() != 64) {
+			return false;
+		}
+		std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)> sig(ECDSA_SIG_new(), ECDSA_SIG_free);
+		ECDSA_SIG_set0(sig.get(), BN_bin2bn(reinterpret_cast<const unsigned char *>(signature.data()), 32, nullptr),
+		               BN_bin2bn(reinterpret_cast<const unsigned char *>(signature.data()) + 32, 32, nullptr));
+		unsigned char *der = nullptr;
+		auto size = i2d_ECDSA_SIG(sig.get(), &der);
+		signature.assign(reinterpret_cast<char *>(der), size_t(size));
+		OPENSSL_free(der);
+	}
+	auto input = jwt.substr(0, second);
+	std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+	return EVP_DigestVerifyInit(ctx.get(), nullptr, EVP_sha256(), nullptr, key.get()) == 1 &&
+	       EVP_DigestVerify(ctx.get(), reinterpret_cast<const unsigned char *>(signature.data()), signature.size(),
+	                        reinterpret_cast<const unsigned char *>(input.data()), input.size()) == 1;
+}
+#endif
 
 int failures = 0;
 
@@ -65,7 +216,17 @@ struct FakeIdp {
 	std::mutex exchange_mutex;
 	std::map<std::string, std::string> last_exchange; // the params of the last token exchange
 	std::string last_refresh_scope;                   // the scope of the last refresh grant
-	std::string last_revoked;                         // the token of the last revocation
+	// spec 012: client assertions - the public key per client, the jti seen, the last header; what the platform
+	// endpoints and the audience parameter received
+	std::map<std::string, std::string> client_keys;
+	std::string client_thumbprint; // cert-client's x5t#S256
+	std::set<std::string> seen_jti;
+	std::string last_assertion_header;
+	std::string last_cc_audience;
+	std::string last_device_audience;
+	std::string last_mi;
+	std::string last_github;
+	std::string last_revoked; // the token of the last revocation
 
 	std::string Issuer() const {
 		return "http://127.0.0.1:" + std::to_string(port);
@@ -145,7 +306,47 @@ struct FakeIdp {
 			last_revoked = req.get_param_value("token") + "|" + req.get_param_value("token_type_hint") + "|" +
 			               req.get_param_value("client_id");
 		});
-		server.Post("/device", [this](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
+		// spec 012: Azure's platform endpoints and GitHub's token service
+		server.Get("/metadata/identity/oauth2/token", [this](const duckdb_httplib::Request &req,
+		                                                     duckdb_httplib::Response &res) {
+			if (req.get_header_value("Metadata") != "true" || req.get_param_value("api-version") != "2018-02-01") {
+				res.status = 400;
+				res.set_content("{\"error\":\"invalid_request\",\"error_description\":\"no Metadata header\"}",
+				                "application/json");
+				return;
+			}
+			{
+				std::lock_guard<std::mutex> guard(exchange_mutex);
+				last_mi = req.get_param_value("resource") + "|" + req.get_param_value("client_id");
+			}
+			res.set_content("{\"access_token\":\"mi-token\",\"expires_in\":\"3599\",\"token_type\":\"Bearer\"}",
+			                "application/json");
+		});
+		server.Get("/msi/token", [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+			if (req.get_header_value("X-IDENTITY-HEADER") != "hdr" ||
+			    req.get_param_value("api-version") != "2019-08-01") {
+				res.status = 401;
+				return;
+			}
+			res.set_content("{\"access_token\":\"app-token\",\"expires_on\":\"" + std::to_string(Now() + 3600) + "\"}",
+			                "application/json");
+		});
+		server.Get("/gh", [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+			if (req.get_header_value("Authorization") != "bearer ghtok") {
+				res.status = 401;
+				return;
+			}
+			{
+				std::lock_guard<std::mutex> guard(exchange_mutex);
+				last_github = req.get_param_value("audience");
+			}
+			res.set_content("{\"count\":1,\"value\":\"gh-jwt\"}", "application/json");
+		});
+		server.Post("/device", [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+			{
+				std::lock_guard<std::mutex> guard(exchange_mutex);
+				last_device_audience = req.get_param_value("audience");
+			}
 			res.set_content("{\"device_code\":\"dc-1\",\"user_code\":\"WDJB-MJHT\",\"verification_uri\":\"" + Issuer() +
 			                    "/activate\",\"interval\":0,\"expires_in\":60}",
 			                "application/json");
@@ -157,7 +358,46 @@ struct FakeIdp {
 				res.set_content("{\"error\":\"" + code + "\",\"error_description\":\"" + description + "\"}",
 				                "application/json");
 			};
+			if (grant == "client_credentials" && req.has_param("client_assertion")) {
+				std::lock_guard<std::mutex> guard(exchange_mutex);
+				auto client = req.get_param_value("client_id");
+				auto assertion = req.get_param_value("client_assertion");
+				if (req.get_param_value("client_assertion_type") !=
+				    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer") {
+					deny("invalid_client", "not a jwt-bearer assertion");
+				} else if (client == "fed-client") {
+					// a federated assertion: the platform's token, checked by the IdP's federation (here: its value)
+					assertion == "platform-jwt"
+					    ? res.set_content("{\"access_token\":\"fed-token\",\"expires_in\":60}", "application/json")
+					    : deny("invalid_client", "an assertion the federation does not trust");
+				} else {
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+					std::string header, payload;
+					auto key = client_keys.find(client);
+					bool ok = key != client_keys.end() && VerifyJwt(assertion, key->second, header, payload);
+					int64_t exp = std::atoll(JsonField(payload, "exp").c_str());
+					auto jti = JsonField(payload, "jti");
+					ok = ok && JsonField(payload, "iss") == client && JsonField(payload, "sub") == client &&
+					     JsonField(payload, "aud") == Issuer() + "/token" && exp > Now() && exp <= Now() + 120 &&
+					     !jti.empty() && seen_jti.insert(jti).second;
+					if (client == "cert-client") {
+						ok = ok && JsonField(header, "x5t#S256") == client_thumbprint &&
+						     !JsonField(header, "x5t").empty();
+					}
+					last_assertion_header = header;
+					ok ? res.set_content("{\"access_token\":\"jwt-token\",\"expires_in\":60}", "application/json")
+					   : deny("invalid_client", "the client assertion does not verify");
+#else
+					deny("invalid_client", "no verification in a plain build");
+#endif
+				}
+				return;
+			}
 			if (grant == "client_credentials") {
+				{
+					std::lock_guard<std::mutex> guard(exchange_mutex);
+					last_cc_audience = req.get_param_value("audience");
+				}
 				if (req.get_param_value("client_id") == "svc" && req.get_param_value("client_secret") == "s3cr3t") {
 					res.set_content("{\"access_token\":\"cc-token\",\"expires_in\":120}", "application/json");
 				} else {
@@ -361,11 +601,6 @@ bool BindShared(int port) {
 }
 #endif
 
-int64_t Now() {
-	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-	    .count();
-}
-
 } // namespace
 
 int main() {
@@ -404,6 +639,144 @@ int main() {
 		auto unsupported = Revoke(none, "cli", "", "rt-x");
 		Check(!unsupported.ok && unsupported.error.find("no revocation_endpoint") != std::string::npos,
 		      "no endpoint: said so, nothing sent");
+	});
+
+	Scenario("private_key_jwt - a client that signs its own assertion (spec 012)", [&] {
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+		std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> rsa(EVP_RSA_gen(2048), EVP_PKEY_free);
+		std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> ec(EVP_EC_gen("P-256"), EVP_PKEY_free);
+		std::string thumbprint;
+		auto cert = SelfSigned(rsa.get(), thumbprint);
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			idp.client_keys["rsa-client"] = Pem(rsa.get(), false);
+			idp.client_keys["ec-client"] = Pem(ec.get(), false);
+			idp.client_keys["kid-client"] = Pem(rsa.get(), false);
+			idp.client_keys["cert-client"] = Pem(rsa.get(), false);
+			idp.client_thumbprint = thumbprint;
+		}
+		auto login = [&](const std::string &client, EVP_PKEY *key, const std::string &kid = "",
+		                 const std::string &certificate = "") {
+			ClientAuth auth;
+			auth.client_id = client;
+			auth.private_key_pem = Pem(key, true);
+			auth.key_id = kid;
+			auth.certificate_pem = certificate;
+			return ClientCredentials(ep, auth);
+		};
+		auto rs = login("rsa-client", rsa.get());
+		Check(rs.Ok() && rs.access_token == "jwt-token", "RS256: the IdP verifies the assertion: " + rs.error);
+		auto es = login("ec-client", ec.get());
+		Check(es.Ok(), "ES256 (r||s): the IdP verifies the assertion: " + es.error);
+		auto kid = login("kid-client", rsa.get(), "k1");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(kid.Ok() && JsonField(idp.last_assertion_header, "kid") == "k1", "the kid is in the header");
+		}
+		auto certified = login("cert-client", rsa.get(), "", cert);
+		Check(certified.Ok(), "x5t and x5t#S256 of the certificate are in the header: " + certified.error);
+		auto wrong = login("ec-client", rsa.get());
+		Check(!wrong.Ok() && wrong.error_code == "invalid_client", "another key's signature is refused");
+		// an assertion is good once: signed for the endpoint, presented twice, refused the second time
+		auto once = SignClientAssertion("rsa-client", idp.Issuer() + "/token", Pem(rsa.get(), true));
+		ClientAuth replay;
+		replay.client_id = "rsa-client";
+		replay.assertion = once.jwt;
+		auto first = ClientCredentials(ep, replay);
+		auto second = ClientCredentials(ep, replay);
+		Check(first.Ok() && !second.Ok(), "a replayed assertion (the same jti) is refused");
+		Check(second.error.find(once.jwt) == std::string::npos, "the refused assertion is not in the error");
+		auto garbage =
+		    SignClientAssertion("c", "a", "-----BEGIN PRIVATE KEY-----\nnot-a-key\n-----END PRIVATE KEY-----\n");
+		Check(!garbage.error.empty() && garbage.error.find("not-a-key") == std::string::npos,
+		      "a key that is not one: refused, and not quoted: " + garbage.error);
+		auto encrypted = SignClientAssertion("c", "a", Pem(rsa.get(), true, "pass-phrase"));
+		Check(!encrypted.error.empty(), "an encrypted key is refused (no prompt): " + encrypted.error);
+		std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> small(EVP_RSA_gen(1024), EVP_PKEY_free);
+		auto weak = SignClientAssertion("c", "a", Pem(small.get(), true));
+		Check(!weak.error.empty(), "an RSA key under 2048 bits is refused: " + weak.error);
+#else
+		auto plain = SignClientAssertion("c", "a", "key");
+		Check(!plain.error.empty() && plain.error.find("TLS") != std::string::npos,
+		      "a plain build cannot sign, and says so: " + plain.error);
+#endif
+	});
+
+	Scenario("federated client assertion - the platform's token, as is (spec 012)", [&] {
+		ClientAuth federated;
+		federated.client_id = "fed-client";
+		federated.assertion = "platform-jwt";
+		auto granted = ClientCredentials(ep, federated);
+		Check(granted.Ok() && granted.access_token == "fed-token", "the platform's token is the client's proof");
+		federated.assertion = "untrusted-platform-jwt";
+		auto refused = ClientCredentials(ep, federated);
+		Check(!refused.Ok() && refused.error.find("untrusted-platform-jwt") == std::string::npos,
+		      "an untrusted one is refused, and not quoted: " + refused.error);
+	});
+
+	Scenario("Azure managed identity - IMDS and the App Service endpoint (spec 012)", [&] {
+		ManagedIdentity identity;
+		identity.resource = "api://svc";
+		identity.imds = idp.Issuer();
+		auto system = ManagedIdentityToken(identity);
+		Check(system.Ok() && system.access_token == "mi-token" && system.expires_at > Now() + 3000,
+		      "IMDS: the Metadata header, a token, the expiry read from a string: " + system.error);
+		identity.client_id = "user-assigned";
+		ManagedIdentityToken(identity);
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(idp.last_mi == "api://svc|user-assigned", "the resource and a user-assigned identity are asked for");
+		}
+		ManagedIdentity remote = identity;
+		remote.imds = "http://metadata.example.com";
+		Check(!ManagedIdentityToken(remote).Ok(), "an IMDS that is neither loopback nor link-local is refused");
+#ifndef _WIN32
+		setenv("IDENTITY_ENDPOINT", (idp.Issuer() + "/msi/token").c_str(), 1);
+		setenv("IDENTITY_HEADER", "hdr", 1);
+		auto app = ManagedIdentityToken(identity);
+		Check(app.Ok() && app.access_token == "app-token" && app.expires_at > Now(),
+		      "App Service: IDENTITY_ENDPOINT with its header, expires_on read: " + app.error);
+		setenv("IDENTITY_ENDPOINT", "http://10.1.2.3/msi/token", 1);
+		auto elsewhere = ManagedIdentityToken(identity);
+		Check(!elsewhere.Ok() && elsewhere.error.find("loopback") != std::string::npos,
+		      "an IDENTITY_ENDPOINT elsewhere is refused, nothing sent: " + elsewhere.error);
+		unsetenv("IDENTITY_ENDPOINT");
+		unsetenv("IDENTITY_HEADER");
+#endif
+	});
+
+	Scenario("GitHub Actions' OIDC token (spec 012)", [&] {
+#ifndef _WIN32
+		unsetenv("ACTIONS_ID_TOKEN_REQUEST_URL");
+		auto none = GithubActionsToken("aud");
+		Check(!none.Ok() && none.error.find("id-token") != std::string::npos, "no job token: said so");
+		setenv("ACTIONS_ID_TOKEN_REQUEST_URL", (idp.Issuer() + "/gh?api-version=2.0").c_str(), 1);
+		setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ghtok", 1);
+		auto token = GithubActionsToken("api://AzureADTokenExchange");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(token.Ok() && token.access_token == "gh-jwt" && idp.last_github == "api://AzureADTokenExchange",
+			      "the job's token for the audience asked: " + token.error);
+		}
+		unsetenv("ACTIONS_ID_TOKEN_REQUEST_URL");
+		unsetenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+#endif
+	});
+
+	Scenario("the audience parameter on the three requests (spec 012)", [&] {
+		ClientAuth svc;
+		svc.client_id = "svc";
+		svc.client_secret = "s3cr3t";
+		auto granted = ClientCredentials(ep, svc, "", {{"audience", "https://api.example"}});
+		auto begun = DeviceBegin(ep, "cli", "openid", {{"audience", "https://api.example"}});
+		auto authorize = BuildAuthorizationRequest(ep, "cli", "http://127.0.0.1/cb", "openid",
+		                                           {{"audience", "https://api.example"}, {"state", "forged"}});
+		std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+		Check(granted.Ok() && idp.last_cc_audience == "https://api.example", "client credentials carries it");
+		Check(begun.Ok() && idp.last_device_audience == "https://api.example", "the device request carries it");
+		Check(authorize.url.find("audience=https%3A%2F%2Fapi.example") != std::string::npos &&
+		          authorize.url.find("state=forged") == std::string::npos,
+		      "the authorization request carries it - and an extra never replaces the flow's own parameters");
 	});
 
 	Scenario("client_credentials - the machine identity flow", [&] {
