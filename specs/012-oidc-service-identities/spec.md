@@ -30,16 +30,22 @@ credential-free ways and one parameter:
 ### Client assertions (`oidc/`)
 
 ```cpp
-//! How a confidential client proves itself at the token endpoint.
+//! How a confidential client proves itself at the token endpoint - the first given of: a private key (signed
+//! here, per request), a federated assertion (as is), a client secret.
 struct ClientAuth {
 	std::string client_id;
-	std::string client_secret;  // client_secret_post, as today
-	std::string assertion;      // client_assertion (jwt-bearer): signed here, or handed in (federated)
+	std::string client_secret;      // client_secret_post, as today
+	std::string private_key_pem;    // private_key_jwt
+	std::string key_id;             // the header's kid
+	std::string certificate_pem;    // x5t / x5t#S256
+	std::string assertion_audience; // the assertion's aud; empty: the token endpoint (Auth0 wants its issuer)
+	std::string assertion;          // a federated client assertion
 };
 
 //! RFC 7523: a client assertion signed with the client's key - iss = sub = client_id, aud = the token endpoint,
-//! jti random, iat now, exp now + 60 s. RS256 for an RSA key, ES256 for a P-256 key; `kid` when given; with a
-//! certificate, `x5t#S256` (and `x5t`, which Entra reads) of its DER.
+//! jti random, iat now, exp now + 300 s, no nbf. RS256 for an RSA key (2048 bits or more), ES256 for a P-256 key
+//! (checked by curve name); `kid` when given; with a certificate, `x5t#S256` and `x5t` (SHA-1, which Entra
+//! reads) of its DER.
 struct SignedAssertion { std::string jwt; std::string error; };
 SignedAssertion SignClientAssertion(const std::string &client_id, const std::string &audience,
                                     const std::string &private_key_pem, const std::string &key_id = "",
@@ -75,6 +81,7 @@ since the module reads no files.
 struct ManagedIdentity {
 	std::string resource;   // what the token is for: an app ID URI or its client id
 	std::string client_id;  // a user-assigned identity; empty: the system-assigned one
+	std::string imds = "http://169.254.169.254"; // loopback or link-local only (tests point it at a fake)
 };
 //! App Service / Functions / Container Apps: IDENTITY_ENDPOINT + X-IDENTITY-HEADER (api-version 2019-08-01);
 //! otherwise IMDS: GET http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01 with
@@ -127,6 +134,46 @@ above, the test checks:
 - a garbage key and an encrypted key are refused without being quoted;
 - an RSA key under 2048 bits is refused;
 - a plain build (no TLS) says it cannot sign.
+
+## The review's findings (applied)
+
+- **MEDIUM: "local" accepted a DNS name.** It took a prefix, so `169.254.attacker.example` passed, as
+  did a URL with userinfo (both confirmed). Now only literal addresses count: 127.0.0.0/8,
+  169.254.0.0/16, `::1`, and `localhost`. Userinfo is refused.
+- **MEDIUM: ES256 took any 256-bit curve.** secp256k1 and brainpoolP256r1 signed a JWT labelled ES256
+  (confirmed). Now it is P-256 by curve name, or refused.
+- **MEDIUM: `aud` was fixed at the token endpoint, and the time claims were tight.**
+  - `ClientAuth::assertion_audience` overrides it; Auth0 wants its issuer.
+  - `nbf` is gone (RFC 7523 makes it optional), and `exp` is now + 300 s.
+- **MEDIUM: an answer with no expiry was cached forever,** and a huge `expires_on` saturated. Now
+  `expires_on` is clamped to a year, and GitHub's token takes its expiry from its own `exp`.
+- **MEDIUM: the identity header and error codes were not redacted.** Now what the caller presented
+  (a secret, an assertion, a subject or refresh token, the identity header, GitHub's bearer) is cut
+  out of the raw answer before it is parsed. A quoted credential is gone before the description's
+  length limit could cut it in two.
+- **Smaller fixes:**
+  - the endpoints are checked before a key signs;
+  - `extra` can never add `request`, `request_uri` or `response_mode`;
+  - a value under 8 characters is not redacted (it cut "exchange" apart);
+  - `JsonQuote` is under TLS, which clears the plain build's warning;
+  - `<cstdio>` is included;
+  - the header documents the precedence, the unsupported Azure hosts (Service Fabric, Arc) and GitHub's
+    expiry.
+- **Tests added:**
+  - a quoted assertion and a quoted identity header are cut out;
+  - the four non-local addresses;
+  - GitHub over plain http;
+  - secp256k1;
+  - `extra` trying to replace `client_id`/`client_secret`, and `request_uri`/`response_mode`;
+  - `expires_on` clamped;
+  - `x5t` equal to the certificate's SHA-1;
+  - GitHub's expiry read from its JWT;
+  - token exchange with a key.
+- **Not taken:**
+  - IMDS retries (the caller retries);
+  - `_putenv_s` for the environment scenarios on Windows (the OIDC test runs on Linux and macOS in
+    CI);
+  - wiping httplib's own buffers, which is out of the module's reach (best effort, as documented).
 
 ## Compatibility
 

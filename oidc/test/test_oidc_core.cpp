@@ -76,6 +76,24 @@ std::string B64UrlDecode(const std::string &in) {
 	return out;
 }
 
+std::string Encode64Url(const std::string &raw) {
+	static const char *alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	std::string out;
+	int buffer = 0, bits = 0;
+	for (unsigned char c : raw) {
+		buffer = ((buffer << 8) | c) & 0xffff;
+		bits += 8;
+		while (bits >= 6) {
+			bits -= 6;
+			out.push_back(alphabet[(buffer >> bits) & 0x3f]);
+		}
+	}
+	if (bits > 0) {
+		out.push_back(alphabet[(buffer << (6 - bits)) & 0x3f]);
+	}
+	return out;
+}
+
 //! "key":"value" or "key":number out of flat JSON - enough for a test's own assertions.
 std::string JsonField(const std::string &json, const std::string &key) {
 	auto at = json.find("\"" + key + "\":");
@@ -107,7 +125,7 @@ std::string Pem(EVP_PKEY *key, bool with_private, const char *passphrase = nullp
 }
 
 //! A self-signed certificate for `key`, and the base64url SHA-256 of its DER (what x5t#S256 must say).
-std::string SelfSigned(EVP_PKEY *key, std::string &thumbprint) {
+std::string SelfSigned(EVP_PKEY *key, std::string &thumbprint, std::string *sha1_thumbprint = nullptr) {
 	std::unique_ptr<X509, decltype(&X509_free)> cert(X509_new(), X509_free);
 	ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1);
 	X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
@@ -122,6 +140,12 @@ std::string SelfSigned(EVP_PKEY *key, std::string &thumbprint) {
 	unsigned char digest[EVP_MAX_MD_SIZE];
 	unsigned int digest_size = 0;
 	EVP_Digest(der, size_t(size), digest, &digest_size, EVP_sha256(), nullptr);
+	if (sha1_thumbprint) {
+		unsigned char sha1[EVP_MAX_MD_SIZE];
+		unsigned int sha1_size = 0;
+		EVP_Digest(der, size_t(size), sha1, &sha1_size, EVP_sha1(), nullptr);
+		*sha1_thumbprint = Encode64Url(std::string(reinterpret_cast<char *>(sha1), sha1_size));
+	}
 	OPENSSL_free(der);
 	std::string raw(reinterpret_cast<char *>(digest), digest_size);
 	// the core's own base64url, through a PKCE challenge of nothing would not do: encode here
@@ -219,7 +243,8 @@ struct FakeIdp {
 	// spec 012: client assertions - the public key per client, the jti seen, the last header; what the platform
 	// endpoints and the audience parameter received
 	std::map<std::string, std::string> client_keys;
-	std::string client_thumbprint; // cert-client's x5t#S256
+	std::string client_thumbprint;      // cert-client's x5t#S256
+	std::string client_sha1_thumbprint; // and its x5t
 	std::set<std::string> seen_jti;
 	std::string last_assertion_header;
 	std::string last_cc_audience;
@@ -323,9 +348,16 @@ struct FakeIdp {
 			                "application/json");
 		});
 		server.Get("/msi/token", [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
-			if (req.get_header_value("X-IDENTITY-HEADER") != "hdr" ||
-			    req.get_param_value("api-version") != "2019-08-01") {
+			auto header = req.get_header_value("X-IDENTITY-HEADER");
+			if (header == "far-future-header") {
+				res.set_content("{\"access_token\":\"far-token\",\"expires_on\":\"99999999999999999999\"}",
+				                "application/json");
+				return;
+			}
+			if (header != "hdr" || req.get_param_value("api-version") != "2019-08-01") {
 				res.status = 401;
+				res.set_content("{\"error\":\"unauthorized\",\"error_description\":\"header " + header + " refused\"}",
+				                "application/json");
 				return;
 			}
 			res.set_content("{\"access_token\":\"app-token\",\"expires_on\":\"" + std::to_string(Now() + 3600) + "\"}",
@@ -340,7 +372,9 @@ struct FakeIdp {
 				std::lock_guard<std::mutex> guard(exchange_mutex);
 				last_github = req.get_param_value("audience");
 			}
-			res.set_content("{\"count\":1,\"value\":\"gh-jwt\"}", "application/json");
+			// a JWT-shaped token with an exp and no expiry beside it: the caller reads the expiry from the token
+			auto payload = Encode64Url("{\"aud\":\"x\",\"exp\":" + std::to_string(Now() + 600) + "}");
+			res.set_content("{\"count\":1,\"value\":\"eyJhbGciOiJub25lIn0." + payload + ".sig\"}", "application/json");
 		});
 		server.Post("/device", [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 			{
@@ -365,6 +399,9 @@ struct FakeIdp {
 				if (req.get_param_value("client_assertion_type") !=
 				    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer") {
 					deny("invalid_client", "not a jwt-bearer assertion");
+				} else if (client == "quote-client") {
+					// an IdP that quotes the assertion back: it must never reach the caller's error
+					deny("invalid_client", "assertion " + assertion + " is not trusted");
 				} else if (client == "fed-client") {
 					// a federated assertion: the platform's token, checked by the IdP's federation (here: its value)
 					assertion == "platform-jwt"
@@ -378,11 +415,11 @@ struct FakeIdp {
 					int64_t exp = std::atoll(JsonField(payload, "exp").c_str());
 					auto jti = JsonField(payload, "jti");
 					ok = ok && JsonField(payload, "iss") == client && JsonField(payload, "sub") == client &&
-					     JsonField(payload, "aud") == Issuer() + "/token" && exp > Now() && exp <= Now() + 120 &&
+					     JsonField(payload, "aud") == Issuer() + "/token" && exp > Now() && exp <= Now() + 330 &&
 					     !jti.empty() && seen_jti.insert(jti).second;
 					if (client == "cert-client") {
 						ok = ok && JsonField(header, "x5t#S256") == client_thumbprint &&
-						     !JsonField(header, "x5t").empty();
+						     JsonField(header, "x5t") == client_sha1_thumbprint;
 					}
 					last_assertion_header = header;
 					ok ? res.set_content("{\"access_token\":\"jwt-token\",\"expires_in\":60}", "application/json")
@@ -441,6 +478,21 @@ struct FakeIdp {
 				if (client == "public-node" && !req.has_param("client_secret")) {
 					res.set_content("{\"access_token\":\"public-exchanged\",\"issued_token_type\":\"" + at + "\"}",
 					                "application/json");
+				} else if (req.has_param("client_assertion")) {
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+					// a client that proves itself with its key (spec 012): the signature and the audience
+					std::string header, payload;
+					std::lock_guard<std::mutex> guard(exchange_mutex);
+					auto key = client_keys.find(client);
+					bool ok = key != client_keys.end() &&
+					          VerifyJwt(req.get_param_value("client_assertion"), key->second, header, payload) &&
+					          JsonField(payload, "aud") == Issuer() + "/token";
+					ok ? res.set_content("{\"access_token\":\"keyed-exchanged\",\"issued_token_type\":\"" + at + "\"}",
+					                     "application/json")
+					   : deny("invalid_client", "the client assertion does not verify");
+#else
+					deny("invalid_client", "no verification in a plain build");
+#endif
 				} else if (client == "unregistered") {
 					deny("unauthorized_client", "the client may not exchange tokens");
 				} else if (client != "node" || req.get_param_value("client_secret") != "node-secret") {
@@ -646,7 +698,8 @@ int main() {
 		std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> rsa(EVP_RSA_gen(2048), EVP_PKEY_free);
 		std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> ec(EVP_EC_gen("P-256"), EVP_PKEY_free);
 		std::string thumbprint;
-		auto cert = SelfSigned(rsa.get(), thumbprint);
+		std::string sha1_thumbprint;
+		auto cert = SelfSigned(rsa.get(), thumbprint, &sha1_thumbprint);
 		{
 			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
 			idp.client_keys["rsa-client"] = Pem(rsa.get(), false);
@@ -654,6 +707,7 @@ int main() {
 			idp.client_keys["kid-client"] = Pem(rsa.get(), false);
 			idp.client_keys["cert-client"] = Pem(rsa.get(), false);
 			idp.client_thumbprint = thumbprint;
+			idp.client_sha1_thumbprint = sha1_thumbprint;
 		}
 		auto login = [&](const std::string &client, EVP_PKEY *key, const std::string &kid = "",
 		                 const std::string &certificate = "") {
@@ -695,6 +749,16 @@ int main() {
 		std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> small(EVP_RSA_gen(1024), EVP_PKEY_free);
 		auto weak = SignClientAssertion("c", "a", Pem(small.get(), true));
 		Check(!weak.error.empty(), "an RSA key under 2048 bits is refused: " + weak.error);
+		std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> k1(EVP_EC_gen("secp256k1"), EVP_PKEY_free);
+		auto other_curve = SignClientAssertion("c", "a", Pem(k1.get(), true));
+		Check(!other_curve.error.empty(), "a 256-bit curve that is not P-256 is refused: " + other_curve.error);
+		// token exchange as a client with a key (a node acting for sessions without a secret)
+		ClientAuth keyed;
+		keyed.client_id = "rsa-client";
+		keyed.private_key_pem = Pem(rsa.get(), true);
+		auto exchanged = TokenExchange(ep, keyed, "user-token-for-node", "api");
+		Check(exchanged.Ok() && exchanged.access_token == "keyed-exchanged",
+		      "token exchange with a signed assertion: " + exchanged.error);
 #else
 		auto plain = SignClientAssertion("c", "a", "key");
 		Check(!plain.error.empty() && plain.error.find("TLS") != std::string::npos,
@@ -708,6 +772,12 @@ int main() {
 		federated.assertion = "platform-jwt";
 		auto granted = ClientCredentials(ep, federated);
 		Check(granted.Ok() && granted.access_token == "fed-token", "the platform's token is the client's proof");
+		ClientAuth quoting;
+		quoting.client_id = "quote-client";
+		quoting.assertion = "quoted-platform-assertion-xyz";
+		auto quoted = ClientCredentials(ep, quoting);
+		Check(!quoted.Ok() && quoted.error.find("quoted-platform-assertion-xyz") == std::string::npos,
+		      "an IdP quoting the assertion back: it is cut out: " + quoted.error);
 		federated.assertion = "untrusted-platform-jwt";
 		auto refused = ClientCredentials(ep, federated);
 		Check(!refused.Ok() && refused.error.find("untrusted-platform-jwt") == std::string::npos,
@@ -736,6 +806,19 @@ int main() {
 		auto app = ManagedIdentityToken(identity);
 		Check(app.Ok() && app.access_token == "app-token" && app.expires_at > Now(),
 		      "App Service: IDENTITY_ENDPOINT with its header, expires_on read: " + app.error);
+		setenv("IDENTITY_HEADER", "quoted-identity-header", 1);
+		auto quoted = ManagedIdentityToken(identity);
+		Check(!quoted.Ok() && quoted.error.find("quoted-identity-header") == std::string::npos,
+		      "an endpoint quoting the identity header back: it is cut out: " + quoted.error);
+		setenv("IDENTITY_HEADER", "far-future-header", 1);
+		auto far = ManagedIdentityToken(identity);
+		Check(far.Ok() && far.expires_at <= Now() + 366 * 86400, "an expires_on beyond a year is clamped");
+		setenv("IDENTITY_HEADER", "hdr", 1);
+		for (auto *address : {"http://169.254.attacker.example/msi", "http://127.0.0.1@evil.example/msi",
+		                      "http://127.0.0.1.nip.io/msi", "http://1270.0.0.1/msi"}) {
+			setenv("IDENTITY_ENDPOINT", address, 1);
+			Check(!ManagedIdentityToken(identity).Ok(), std::string("not a literal local address: ") + address);
+		}
 		setenv("IDENTITY_ENDPOINT", "http://10.1.2.3/msi/token", 1);
 		auto elsewhere = ManagedIdentityToken(identity);
 		Check(!elsewhere.Ok() && elsewhere.error.find("loopback") != std::string::npos,
@@ -755,9 +838,14 @@ int main() {
 		auto token = GithubActionsToken("api://AzureADTokenExchange");
 		{
 			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
-			Check(token.Ok() && token.access_token == "gh-jwt" && idp.last_github == "api://AzureADTokenExchange",
+			Check(token.Ok() && token.access_token.rfind("eyJ", 0) == 0 &&
+			          idp.last_github == "api://AzureADTokenExchange",
 			      "the job's token for the audience asked: " + token.error);
+			Check(token.expires_at > Now() + 500 && token.expires_at <= Now() + 600,
+			      "its expiry read from the JWT's exp");
 		}
+		setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "http://token.actions.example/x", 1);
+		Check(!GithubActionsToken("aud").Ok(), "a GitHub token URL that is neither https nor loopback is refused");
 		unsetenv("ACTIONS_ID_TOKEN_REQUEST_URL");
 		unsetenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
 #endif
@@ -768,14 +856,27 @@ int main() {
 		svc.client_id = "svc";
 		svc.client_secret = "s3cr3t";
 		auto granted = ClientCredentials(ep, svc, "", {{"audience", "https://api.example"}});
+		std::string cc_audience;
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			cc_audience = idp.last_cc_audience;
+		}
+		auto overridden =
+		    ClientCredentials(ep, svc, "", {{"client_id", "someone-else"}, {"client_secret", "not-the-secret"}});
 		auto begun = DeviceBegin(ep, "cli", "openid", {{"audience", "https://api.example"}});
 		auto authorize = BuildAuthorizationRequest(ep, "cli", "http://127.0.0.1/cb", "openid",
-		                                           {{"audience", "https://api.example"}, {"state", "forged"}});
+		                                           {{"audience", "https://api.example"},
+		                                            {"state", "forged"},
+		                                            {"request_uri", "urn:forged"},
+		                                            {"response_mode", "form_post"}});
 		std::lock_guard<std::mutex> guard(idp.exchange_mutex);
-		Check(granted.Ok() && idp.last_cc_audience == "https://api.example", "client credentials carries it");
+		Check(granted.Ok() && cc_audience == "https://api.example", "client credentials carries it");
+		Check(overridden.Ok(), "an extra never replaces the client's own id or secret");
 		Check(begun.Ok() && idp.last_device_audience == "https://api.example", "the device request carries it");
 		Check(authorize.url.find("audience=https%3A%2F%2Fapi.example") != std::string::npos &&
-		          authorize.url.find("state=forged") == std::string::npos,
+		          authorize.url.find("state=forged") == std::string::npos &&
+		          authorize.url.find("request_uri") == std::string::npos &&
+		          authorize.url.find("response_mode") == std::string::npos,
 		      "the authorization request carries it - and an extra never replaces the flow's own parameters");
 	});
 

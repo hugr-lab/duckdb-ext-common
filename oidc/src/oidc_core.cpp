@@ -15,10 +15,12 @@
 
 #include "oidc_core.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include "yyjson.hpp"
 
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <random>
 #include <thread>
@@ -331,13 +333,62 @@ std::string CallbackPage(bool ok) {
 	       (ok ? "Login complete." : "Login failed.") + " You can close this window.</p></body></html>";
 }
 
-TokenSet PostGrant(const Endpoints &ep, const std::map<std::string, std::string> &params) {
+//! What the caller presented, cut out of an answer's raw body before anything reads it: an IdP that quotes a
+//! credential back never gets it into an error, even one the description's length limit would cut in two.
+//! Values under 8 characters are no credentials, and replacing them would cut ordinary words apart.
+void HideIn(std::string &body, const std::vector<std::string> &hide) {
+	for (auto &secret : hide) {
+		if (secret.size() < 8) {
+			continue;
+		}
+		for (auto at = body.find(secret); at != std::string::npos; at = body.find(secret, at)) {
+			body.replace(at, secret.size(), "<redacted>");
+		}
+	}
+}
+
+//! base64url (no padding) to bytes; stops at the first character that is not one.
+std::string Base64UrlDecode(const std::string &in) {
+	std::string out;
+	int buffer = 0;
+	int bits = 0;
+	for (char c : in) {
+		int value;
+		if (c >= 'A' && c <= 'Z') {
+			value = c - 'A';
+		} else if (c >= 'a' && c <= 'z') {
+			value = c - 'a' + 26;
+		} else if (c >= '0' && c <= '9') {
+			value = c - '0' + 52;
+		} else if (c == '-') {
+			value = 62;
+		} else if (c == '_') {
+			value = 63;
+		} else {
+			break;
+		}
+		buffer = ((buffer << 6) | value) & 0xffffff;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push_back(char((buffer >> bits) & 0xff));
+		}
+	}
+	return out;
+}
+
+TokenSet PostGrant(const Endpoints &ep, const std::map<std::string, std::string> &params,
+                   const std::vector<std::string> &hide = {}) {
 	if (!ep.Ok()) {
 		TokenSet out;
 		out.error = ep.error.empty() ? "no token endpoint" : ep.error;
 		return out;
 	}
-	return ParseTokenResponse(HttpPostForm(ep.token_endpoint, params));
+	auto response = HttpPostForm(ep.token_endpoint, params);
+	if (!response.Ok()) {
+		HideIn(response.body, hide);
+	}
+	return ParseTokenResponse(response);
 }
 
 } // namespace
@@ -475,6 +526,7 @@ namespace {
 
 void Redact(std::string &error, const std::string &presented); // below, with the exchanges
 
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
 //! A string as JSON text.
 std::string JsonQuote(const std::string &text) {
 	std::string out = "\"";
@@ -498,6 +550,25 @@ std::string JsonQuote(const std::string &text) {
 	}
 	return out + "\"";
 }
+#endif
+
+//! A parameter's value, or "" - never inserting one (an empty client_assertion would change the request).
+std::string Param(const std::map<std::string, std::string> &params, const char *key) {
+	auto found = params.find(key);
+	return found == params.end() ? std::string() : found->second;
+}
+
+//! Overwrite a parameter's value where there is one.
+void WipeParam(std::map<std::string, std::string> &params, const char *key) {
+	auto found = params.find(key);
+	if (found != params.end()) {
+		volatile char *bytes = found->second.empty() ? nullptr : &found->second[0];
+		for (size_t i = 0; i < found->second.size(); i++) {
+			bytes[i] = 0;
+		}
+		found->second.clear();
+	}
+}
 
 void WipeString(std::string &text) {
 	volatile char *bytes = text.empty() ? nullptr : &text[0];
@@ -511,11 +582,17 @@ void WipeString(std::string &text) {
 //! is), or the secret. False with `error` when a key cannot sign.
 bool AddClientAuth(std::map<std::string, std::string> &params, const Endpoints &ep, const ClientAuth &auth,
                    std::string &error) {
+	if (!ep.Ok()) {
+		error = ep.error.empty() ? "no token endpoint" : ep.error;
+		return false;
+	}
 	params["client_id"] = auth.client_id;
 	std::string assertion = auth.assertion;
 	if (!auth.private_key_pem.empty()) {
-		auto signed_assertion = SignClientAssertion(auth.client_id, ep.token_endpoint, auth.private_key_pem,
-		                                            auth.key_id, auth.certificate_pem);
+		// the token endpoint, as RFC 7523 and Entra, Okta, Keycloak have it; Auth0 wants its issuer URL
+		auto audience = auth.assertion_audience.empty() ? ep.token_endpoint : auth.assertion_audience;
+		auto signed_assertion =
+		    SignClientAssertion(auth.client_id, audience, auth.private_key_pem, auth.key_id, auth.certificate_pem);
 		if (!signed_assertion.error.empty()) {
 			error = signed_assertion.error;
 			return false;
@@ -531,22 +608,62 @@ bool AddClientAuth(std::map<std::string, std::string> &params, const Endpoints &
 	return true;
 }
 
-//! A platform endpoint: loopback or link-local only (an environment variable must not redirect a request that
-//! carries an identity header).
+//! A dotted-quad IPv4 literal, strictly: four decimal octets, nothing else (a DNS name never passes).
+bool Ipv4Literal(const std::string &host, int octets[4]) {
+	int count = 0;
+	size_t at = 0;
+	while (count < 4) {
+		size_t digits = 0;
+		int value = 0;
+		while (at < host.size() && std::isdigit(static_cast<unsigned char>(host[at])) && digits < 3) {
+			value = value * 10 + (host[at] - '0');
+			at++;
+			digits++;
+		}
+		if (digits == 0 || value > 255) {
+			return false;
+		}
+		octets[count++] = value;
+		if (count < 4) {
+			if (at >= host.size() || host[at] != '.') {
+				return false;
+			}
+			at++;
+		}
+	}
+	return at == host.size();
+}
+
+//! A platform endpoint: loopback (127.0.0.0/8, ::1, localhost) or link-local (169.254.0.0/16), by literal address
+//! only - an environment variable must not redirect a request that carries an identity header, and a name that
+//! merely starts like one resolves wherever its owner wants.
 bool LocalEndpoint(const std::string &url) {
+	auto scheme = url.find("://");
+	if (scheme == std::string::npos) {
+		return false;
+	}
+	auto authority_end = url.find('/', scheme + 3);
+	auto authority =
+	    url.substr(scheme + 3, authority_end == std::string::npos ? std::string::npos : authority_end - scheme - 3);
+	if (authority.find('@') != std::string::npos) {
+		return false; // userinfo: a host that is not what it reads as
+	}
 	auto parts = ParseUrl(url);
 	if (!parts.error.empty()) {
 		return false;
 	}
-	auto &host = parts.host;
-	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]" ||
-	       host.rfind("169.254.", 0) == 0;
+	if (parts.host == "localhost" || parts.host == "::1") {
+		return true;
+	}
+	int octets[4];
+	return Ipv4Literal(parts.host, octets) && (octets[0] == 127 || (octets[0] == 169 && octets[1] == 254));
 }
 
 //! A platform's token answer: access_token, and expires_in / expires_on as a number or a string (Azure sends
 //! strings).
-TokenSet ParsePlatformToken(const HttpResult &response, const std::string &source) {
+TokenSet ParsePlatformToken(HttpResult response, const std::string &source, const std::vector<std::string> &hide) {
 	TokenSet out;
+	HideIn(response.body, hide);
 	if (!response.error.empty()) {
 		out.error = source + ": " + response.error;
 		out.error_code = "unreachable";
@@ -573,12 +690,26 @@ TokenSet ParsePlatformToken(const HttpResult &response, const std::string &sourc
 		auto as_text = json.Str(key);
 		return as_text.empty() ? 0 : std::strtoll(as_text.c_str(), nullptr, 10);
 	};
+	static constexpr int64_t A_YEAR = int64_t(366) * 86400;
+	auto now = NowSeconds();
 	auto expires_in = number("expires_in");
 	auto expires_on = number("expires_on");
-	if (expires_in > 0 && expires_in < int64_t(366) * 86400) {
-		out.expires_at = NowSeconds() + expires_in;
-	} else if (expires_on > NowSeconds()) {
-		out.expires_at = expires_on;
+	if (expires_in > 0) {
+		out.expires_at = now + std::min(expires_in, A_YEAR);
+	} else if (expires_on > now) {
+		out.expires_at = std::min(expires_on, now + A_YEAR);
+	} else if (!out.access_token.empty()) {
+		// no expiry in the answer (GitHub's): the JWT's own `exp`, read for the expiry only - a cache must not
+		// serve it forever
+		auto first = out.access_token.find('.');
+		auto second = first == std::string::npos ? std::string::npos : out.access_token.find('.', first + 1);
+		if (second != std::string::npos) {
+			Json claims(Base64UrlDecode(out.access_token.substr(first + 1, second - first - 1)));
+			auto exp = claims.Int("exp");
+			if (exp > now) {
+				out.expires_at = std::min(exp, now + A_YEAR);
+			}
+		}
 	}
 	if (out.access_token.empty()) {
 		out.error = source + " answered without a token";
@@ -601,6 +732,18 @@ SignedAssertion SignClientAssertion(const std::string &client_id, const std::str
 	out.error = "a signed client assertion needs a TLS-enabled build (DUCKDB_EXT_COMMON_OIDC_TLS)";
 	return out;
 #else
+	// ES256 is P-256 exactly: another 256-bit curve (secp256k1, brainpool) would sign what the header does not say
+	auto IsP256 = [](EVP_PKEY *pkey) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+		char group[64] = {0};
+		size_t length = 0;
+		return EVP_PKEY_get_group_name(pkey, group, sizeof(group), &length) == 1 &&
+		       std::string(group, length) == "prime256v1";
+#else
+		auto ec = EVP_PKEY_get0_EC_KEY(pkey);
+		return ec && EC_GROUP_get_curve_name(EC_KEY_get0_group(ec)) == NID_X9_62_prime256v1;
+#endif
+	};
 	if (client_id.empty() || audience.empty()) {
 		out.error = "a client assertion needs a client id and an audience";
 		return out;
@@ -625,7 +768,7 @@ SignedAssertion SignClientAssertion(const std::string &client_id, const std::str
 			return out;
 		}
 		alg = "RS256";
-	} else if (type == EVP_PKEY_EC && EVP_PKEY_bits(key.get()) == 256) {
+	} else if (type == EVP_PKEY_EC && IsP256(key.get())) {
 		alg = "ES256";
 	} else {
 		out.error = "the private key is neither RSA nor EC P-256";
@@ -665,8 +808,7 @@ SignedAssertion SignClientAssertion(const std::string &client_id, const std::str
 	auto now = NowSeconds();
 	std::string payload = "{\"iss\":" + JsonQuote(client_id) + ",\"sub\":" + JsonQuote(client_id) +
 	                      ",\"aud\":" + JsonQuote(audience) + ",\"jti\":\"" + RandomUrlSafe(18) +
-	                      "\",\"iat\":" + std::to_string(now) + ",\"nbf\":" + std::to_string(now) +
-	                      ",\"exp\":" + std::to_string(now + 60) + "}";
+	                      "\",\"iat\":" + std::to_string(now) + ",\"exp\":" + std::to_string(now + 300) + "}";
 	auto input = Base64Url(header) + "." + Base64Url(payload);
 	std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(EVP_MD_CTX_new(), EVP_MD_CTX_free);
 	size_t signature_size = 0;
@@ -721,12 +863,14 @@ TokenSet ClientCredentials(const Endpoints &ep, const ClientAuth &auth, const st
 	for (auto &param : extra) {
 		params.emplace(param.first, param.second);
 	}
-	auto out = PostGrant(ep, params);
+	auto out = PostGrant(ep, params, {Param(params, "client_assertion"), auth.client_secret});
 	if (!out.Ok()) {
-		Redact(out.error, params["client_assertion"]);
+		Redact(out.error, Param(params, "client_assertion"));
 		Redact(out.error, auth.client_secret);
+		Redact(out.error_code, Param(params, "client_assertion"));
 	}
-	WipeString(params["client_assertion"]);
+	WipeParam(params, "client_assertion");
+	WipeParam(params, "client_secret");
 	return out;
 }
 
@@ -750,8 +894,12 @@ TokenSet ManagedIdentityToken(const ManagedIdentity &identity, int timeout_secon
 		}
 		auto url = std::string(endpoint) + (std::string(endpoint).find('?') == std::string::npos ? "?" : "&") +
 		           FormEncode(query);
-		return ParsePlatformToken(HttpSend("GET", url, {{"X-IDENTITY-HEADER", secret}}, "", "", timeout_seconds),
-		                          "the managed identity endpoint");
+		auto from_platform =
+		    ParsePlatformToken(HttpSend("GET", url, {{"X-IDENTITY-HEADER", secret}}, "", "", timeout_seconds),
+		                       "the managed identity endpoint", {secret});
+		Redact(from_platform.error, secret);
+		Redact(from_platform.error_code, secret);
+		return from_platform;
 	}
 	if (!LocalEndpoint(identity.imds)) {
 		out.error = "managed identity: the instance metadata endpoint must be loopback or link-local";
@@ -763,7 +911,7 @@ TokenSet ManagedIdentityToken(const ManagedIdentity &identity, int timeout_secon
 	}
 	return ParsePlatformToken(HttpSend("GET", identity.imds + "/metadata/identity/oauth2/token?" + FormEncode(query),
 	                                   {{"Metadata", "true"}}, "", "", timeout_seconds),
-	                          "the Azure instance metadata service");
+	                          "the Azure instance metadata service", {});
 }
 
 TokenSet GithubActionsToken(const std::string &audience, int timeout_seconds) {
@@ -784,8 +932,9 @@ TokenSet GithubActionsToken(const std::string &audience, int timeout_seconds) {
 	}
 	out = ParsePlatformToken(
 	    HttpSend("GET", request_url, {{"Authorization", std::string("bearer ") + bearer}}, "", "", timeout_seconds),
-	    "GitHub Actions' token service");
+	    "GitHub Actions' token service", {bearer});
 	Redact(out.error, bearer);
+	Redact(out.error_code, bearer);
 	return out;
 }
 
@@ -808,8 +957,10 @@ constexpr const char *REFRESH_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:ref
 
 //! A credential the caller presented never reaches an error, even when the IdP quotes it back.
 void Redact(std::string &error, const std::string &presented) {
-	for (auto at = error.find(presented); !presented.empty() && at != std::string::npos;
-	     at = error.find(presented, at)) {
+	if (presented.size() < 8) {
+		return; // no credential is this short; replacing it would cut ordinary words apart
+	}
+	for (auto at = error.find(presented); at != std::string::npos; at = error.find(presented, at)) {
 		error.replace(at, presented.size(), "<redacted>");
 	}
 }
@@ -892,9 +1043,13 @@ TokenSet TokenExchange(const Endpoints &ep, const ClientAuth &auth, const std::s
 	if (!resource.empty()) {
 		params["resource"] = resource;
 	}
-	auto out = FinishExchange(PostGrant(ep, params), subject_token, with_refresh);
-	Redact(out.error, params["client_assertion"]);
-	WipeString(params["client_assertion"]);
+	auto out =
+	    FinishExchange(PostGrant(ep, params, {subject_token, Param(params, "client_assertion"), auth.client_secret}),
+	                   subject_token, with_refresh);
+	Redact(out.error, Param(params, "client_assertion"));
+	Redact(out.error, auth.client_secret);
+	WipeParam(params, "client_assertion");
+	WipeParam(params, "client_secret");
 	return out;
 }
 
@@ -919,9 +1074,12 @@ TokenSet OnBehalfOf(const Endpoints &ep, const ClientAuth &auth, const std::stri
 	if (!AddClientAuth(params, ep, auth, error)) {
 		return Refused("invalid_client", error);
 	}
-	auto out = FinishExchange(PostGrant(ep, params), assertion, with_refresh);
-	Redact(out.error, params["client_assertion"]);
-	WipeString(params["client_assertion"]);
+	auto out = FinishExchange(PostGrant(ep, params, {assertion, Param(params, "client_assertion"), auth.client_secret}),
+	                          assertion, with_refresh);
+	Redact(out.error, Param(params, "client_assertion"));
+	Redact(out.error, auth.client_secret);
+	WipeParam(params, "client_assertion");
+	WipeParam(params, "client_secret");
 	return out;
 }
 
@@ -935,7 +1093,7 @@ TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const s
 	if (!scope.empty()) {
 		params["scope"] = scope;
 	}
-	auto out = PostGrant(ep, params);
+	auto out = PostGrant(ep, params, {refresh_token});
 	if (!out.Ok()) {
 		Redact(out.error, refresh_token); // a refresh token lives long: never in an error either
 	}
@@ -957,6 +1115,7 @@ RevokeResult Revoke(const Endpoints &ep, const std::string &client_id, const std
 		params["client_secret"] = client_secret;
 	}
 	auto response = HttpPostForm(ep.revocation_endpoint, params);
+	HideIn(response.body, {token, client_secret});
 	if (response.Ok()) {
 		out.ok = true;
 		return out;
@@ -1113,7 +1272,12 @@ AuthorizationRequest BuildAuthorizationRequest(const Endpoints &ep, const std::s
 		params["scope"] = scope;
 	}
 	for (auto &param : extra) {
-		params.emplace(param.first, param.second); // never over the flow's own parameters
+		// never over the flow's own parameters, and never one that would replace the request (JAR/PAR) or move its
+		// answer away from the loopback redirect
+		if (param.first == "request" || param.first == "request_uri" || param.first == "response_mode") {
+			continue;
+		}
+		params.emplace(param.first, param.second);
 	}
 	auto separator = ep.authorization_endpoint.find('?') == std::string::npos ? "?" : "&";
 	out.url = ep.authorization_endpoint + separator + FormEncode(params);
