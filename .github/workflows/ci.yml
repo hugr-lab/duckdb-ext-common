@@ -120,8 +120,14 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq libsecret-1-0 gnome-keyring dbus-x11
           env -u DBUS_SESSION_BUS_ADDRESS KEYCHAIN_EXPECT_UNAVAILABLE=1 scripts/test_keychain.sh build/kc-none
-          dbus-run-session -- bash -c \
-            'echo -n ci | gnome-keyring-daemon --unlock --components=secrets >/dev/null; scripts/test_keychain.sh'
+          # then a locked collection: nothing handed out, and no hang (the unlock prompt has no display)
+          dbus-run-session -- bash -c '
+            echo -n ci | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            scripts/test_keychain.sh
+            KEYCHAIN_STEP=store build/keychain-test/test_keychain
+            dbus-send --session --print-reply --dest=org.freedesktop.secrets /org/freedesktop/secrets \
+              org.freedesktop.Secret.Service.Lock array:objpath:/org/freedesktop/secrets/collection/login >/dev/null
+            KEYCHAIN_STEP=load-locked build/keychain-test/test_keychain'
       - name: macOS - a throwaway default keychain
         if: runner.os == 'macOS'
         run: |
@@ -134,3 +140,13 @@ jobs:
       - name: Windows - the Credential Manager
         if: runner.os == 'Windows'
         run: CXX=g++ scripts/test_keychain.sh
+      # what Windows consumers build with: MSVC, warnings as errors on the module
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Windows - MSVC compiles and runs it
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: >
+          cl /nologo /std:c++17 /EHsc /W4 /WX /DDUCKDB_EXT_COMMON_KEYCHAIN_NAMESPACE=ext_common /Ikeychain\include
+          keychain\test\test_keychain.cpp keychain\src\keychain.cpp advapi32.lib /Fe:test_keychain_msvc.exe
+          && test_keychain_msvc.exe

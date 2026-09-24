@@ -39,7 +39,8 @@ git -C duckdb-ext-common checkout <tag>
 include_directories(duckdb-ext-common/hooks duckdb-ext-common/contracts)
 ```
 
-A module (`oidc/`, `keychain/`) is consumed through its `.cmake` file (`oidc/oidc.cmake`) — a list of sources and an include dir the
+A module (`oidc/`, `keychain/`) is consumed through its `.cmake` file (`oidc/oidc.cmake`,
+`keychain/keychain.cmake`) — a list of sources and an include dir the
 consumer compiles into itself under a namespace it names; see [oidc/README.md](oidc/README.md).
 
 ## The rules, in short

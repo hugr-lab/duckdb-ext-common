@@ -4,7 +4,7 @@ One small secret (a person's refresh token, for tresor) per `(service, account)`
 
 | Platform | Store | Links |
 | --- | --- | --- |
-| macOS | Keychain Services, generic password, this device only | `-framework Security -framework CoreFoundation` |
+| macOS | Keychain Services, generic password, the file-based login keychain | `-framework Security -framework CoreFoundation` |
 | Windows | Credential Manager, generic credential, local machine | `advapi32` |
 | Linux | the Secret Service over D-Bus, via `libsecret-1.so.0` loaded at run time | nothing (`dl`) |
 
@@ -20,6 +20,13 @@ target_compile_definitions(<target> PRIVATE DUCKDB_EXT_COMMON_KEYCHAIN_NAMESPACE
 target_link_libraries(<target> ${DUCKDB_EXT_COMMON_KEYCHAIN_LIBS})
 ```
 
-`scripts/test_keychain.sh` runs the test against the real store (spec 010: how CI provides one on each
-platform). The store protects against other OS users and a copied disk, not against another process of
-the same user (on macOS, another binary asks first).
+`scripts/test_keychain.sh` runs the test against the real store (spec 010 says how CI provides one on
+each platform). The secret is NUL-free text, and the names are UTF-8.
+
+**What the store protects.** It keeps the secret from other OS users and off a copied disk. It does not
+keep it from another process of the same user:
+- on macOS, the item belongs to the host binary (`duckdb`, `python3`), and another binary asks first;
+- the login keychain file travels with a backup or a migration;
+- a Linux provider's collection may be a synced file.
+
+Spec 010's "Enforcement & security" covers each platform.
