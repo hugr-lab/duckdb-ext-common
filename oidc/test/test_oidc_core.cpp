@@ -64,6 +64,8 @@ struct FakeIdp {
 	std::atomic<int> codes_exchanged {0};
 	std::mutex exchange_mutex;
 	std::map<std::string, std::string> last_exchange; // the params of the last token exchange
+	std::string last_refresh_scope;                   // the scope of the last refresh grant
+	std::string last_revoked;                         // the token of the last revocation
 
 	std::string Issuer() const {
 		return "http://127.0.0.1:" + std::to_string(port);
@@ -74,7 +76,8 @@ struct FakeIdp {
 		           [this](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
 			           res.set_content("{\"issuer\":\"" + Issuer() + "\",\"token_endpoint\":\"" + Issuer() +
 			                               "/token\",\"device_authorization_endpoint\":\"" + Issuer() +
-			                               "/device\",\"authorization_endpoint\":\"" + Issuer() + "/authorize\"}",
+			                               "/device\",\"authorization_endpoint\":\"" + Issuer() +
+			                               "/authorize\",\"revocation_endpoint\":\"" + Issuer() + "/revoke\"}",
 			                           "application/json");
 		           });
 		// a LYING document: served at /realms/other, speaking for the root issuer - discovery asked
@@ -128,6 +131,20 @@ struct FakeIdp {
 		});
 		server.Delete("/echo",
 		              [](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) { res.status = 204; });
+		// RFC 7009: 200 for any token; a public client `cli` or node's credentials; `quote-me` is refused and
+		// quoted back
+		server.Post("/revoke", [this](const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
+			if (req.get_param_value("token") == "rt-quote-me") {
+				res.status = 400;
+				res.set_content("{\"error\":\"unsupported_token_type\",\"error_description\":\"cannot revoke "
+				                "rt-quote-me\"}",
+				                "application/json");
+				return;
+			}
+			std::lock_guard<std::mutex> guard(exchange_mutex);
+			last_revoked = req.get_param_value("token") + "|" + req.get_param_value("token_type_hint") + "|" +
+			               req.get_param_value("client_id");
+		});
 		server.Post("/device", [this](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
 			res.set_content("{\"device_code\":\"dc-1\",\"user_code\":\"WDJB-MJHT\",\"verification_uri\":\"" + Issuer() +
 			                    "/activate\",\"interval\":0,\"expires_in\":60}",
@@ -158,6 +175,10 @@ struct FakeIdp {
 				return;
 			}
 			if (grant == "refresh_token") {
+				{
+					std::lock_guard<std::mutex> guard(exchange_mutex);
+					last_refresh_scope = req.get_param_value("scope");
+				}
 				if (req.get_param_value("refresh_token") == "rt-1") {
 					res.set_content("{\"access_token\":\"pw-token-2\",\"expires_in\":60}", "application/json");
 				} else if (req.get_param_value("refresh_token") == "rt-quote-me") {
@@ -366,6 +387,25 @@ int main() {
 		      "a canonical trailing slash in the advertised issuer is normalised, not refused: " + slashy.error);
 	});
 
+	Scenario("revocation (RFC 7009, spec 011)", [&] {
+		Check(ep.revocation_endpoint == idp.Issuer() + "/revoke", "the revocation endpoint is discovered");
+		auto revoked = Revoke(ep, "cli", "", "rt-gone");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(revoked.ok && idp.last_revoked == "rt-gone|refresh_token|cli",
+			      "a refresh token revoked as the public client, hinted: " + revoked.error);
+		}
+		auto quoted = Revoke(ep, "cli", "", "rt-quote-me");
+		Check(!quoted.ok && quoted.error_code == "unsupported_token_type" &&
+		          quoted.error.find("rt-quote-me") == std::string::npos,
+		      "a refusal carries the code, never the token: " + quoted.error);
+		Endpoints none = ep;
+		none.revocation_endpoint.clear();
+		auto unsupported = Revoke(none, "cli", "", "rt-x");
+		Check(!unsupported.ok && unsupported.error.find("no revocation_endpoint") != std::string::npos,
+		      "no endpoint: said so, nothing sent");
+	});
+
 	Scenario("client_credentials - the machine identity flow", [&] {
 		auto granted = ClientCredentials(ep, "svc", "s3cr3t");
 		Check(granted.Ok() && granted.access_token == "cc-token", "the right secret earns a token");
@@ -381,6 +421,16 @@ int main() {
 		Check(granted.refresh_token == "rt-1", "with a refresh token");
 		auto renewed = RefreshGrant(ep, "cli", "", granted.refresh_token);
 		Check(renewed.Ok() && renewed.access_token == "pw-token-2", "the refresh renews silently");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(idp.last_refresh_scope.empty(), "no scope asked unless given");
+		}
+		renewed = RefreshGrant(ep, "cli", "", granted.refresh_token, "openid other-service");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(renewed.Ok() && idp.last_refresh_scope == "openid other-service",
+			      "a refresh for another service's scope sends it (spec 011)");
+		}
 		auto denied = PasswordGrant(ep, "cli", "", "analyst", "nope");
 		Check(!denied.Ok() && denied.error_code == "invalid_grant", "wrong credentials refused");
 	});

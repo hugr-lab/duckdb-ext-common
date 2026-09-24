@@ -32,7 +32,7 @@ jobs:
           /tmp/cf/bin/pip install clang_format==11.0.1
       - name: clang-format check
         run: |
-          files="$(find hooks contracts oidc \( -name '*.hpp' -o -name '*.cpp' \) 2>/dev/null)"
+          files="$(find hooks contracts oidc keychain \( -name '*.hpp' -o -name '*.cpp' \) 2>/dev/null)"
           if [ -z "$files" ]; then echo "no sources yet"; exit 0; fi
           echo "$files" | xargs /tmp/cf/bin/clang-format --dry-run --Werror
       - name: yamllint
@@ -99,3 +99,56 @@ jobs:
       # pre-authentication network input
       - name: libFuzzer over the parsers
         run: CXX=clang++ FUZZ_SECONDS=60 scripts/fuzz_oidc.sh /tmp/duckdb build/oidc-fuzz
+
+  keychain:
+    name: Keychain module (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      # spec 010: the real OS store on each platform - Linux's Secret Service is gnome-keyring on a
+      # private session bus, macOS a throwaway keychain made the default, Windows the runner's
+      # Credential Manager (MinGW's g++, which the runner carries)
+      - name: Linux - gnome-keyring on a session bus, and no bus at all
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq libsecret-1-0 gnome-keyring dbus-x11
+          env -u DBUS_SESSION_BUS_ADDRESS -u XDG_RUNTIME_DIR KEYCHAIN_EXPECT_UNAVAILABLE=1 scripts/test_keychain.sh build/kc-none
+          # then a locked collection: nothing handed out, and no hang (the unlock prompt has no display)
+          dbus-run-session -- bash -c '
+            echo -n ci | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            scripts/test_keychain.sh
+            KEYCHAIN_STEP=store build/keychain-test/test_keychain
+            dbus-send --session --print-reply --dest=org.freedesktop.secrets /org/freedesktop/secrets \
+              org.freedesktop.Secret.Service.Lock array:objpath:/org/freedesktop/secrets/collection/login >/dev/null
+            KEYCHAIN_STEP=load-locked build/keychain-test/test_keychain'
+      - name: macOS - a throwaway default keychain
+        if: runner.os == 'macOS'
+        run: |
+          security create-keychain -p ci ci.keychain
+          security unlock-keychain -p ci ci.keychain
+          security default-keychain -s ci.keychain
+          security list-keychains -d user -s ci.keychain
+          scripts/test_keychain.sh
+          security delete-keychain ci.keychain
+          # the default now names a deleted keychain: unavailable, said so - never the system's dialog
+          KEYCHAIN_EXPECT_UNAVAILABLE=1 build/keychain-test/test_keychain
+      - name: Windows - the Credential Manager
+        if: runner.os == 'Windows'
+        run: CXX=g++ scripts/test_keychain.sh
+      # what Windows consumers build with: MSVC, warnings as errors on the module
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Windows - MSVC compiles and runs it
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: >
+          cl /nologo /std:c++17 /EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS /DDUCKDB_EXT_COMMON_KEYCHAIN_NAMESPACE=ext_common /Ikeychain\include
+          keychain\test\test_keychain.cpp keychain\src\keychain.cpp advapi32.lib /Fe:test_keychain_msvc.exe
+          && test_keychain_msvc.exe
