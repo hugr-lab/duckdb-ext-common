@@ -28,3 +28,4 @@ Research and thinking-out-loud live in the local, gitignored `design/` folder.
 | [008](008-hooks-tresor-audit/spec.md) | the hooks base and tresor's audit contract (`TRSA` 1) | implemented |
 | [009](009-audit-gauges-under-lock/spec.md) | the audit gauges read under their lock (no layout change, ACLA stays 2) | implemented |
 | [010](010-keychain/spec.md) | the keychain module — a credential in the operating system's own store | implemented |
+| [011](011-oidc-revocation-scope/spec.md) | the OIDC core revokes (RFC 7009), and refreshes for another scope | implemented |

@@ -20,6 +20,6 @@ share has the same `CONTRACT_VERSION` in both.
 | v0.7.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` |
 | v0.7.0 | `tresor_audit` (`contracts/tresor_audit.hpp`, new, on `hooks/ext_hooks.hpp`) | `TRSA` | 1 | tresor | `v2.0-cyanoptera` (spec 008) |
 | v0.7.1 | `acl_audit` (spec 009: gauges read under their lock - behaviour, not layout) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` |
-| v0.8.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 010: the `keychain/` module, not a contract) |
+| v0.8.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 010: the `keychain/` module; spec 011: `oidc/` revokes and refreshes for a scope - modules, not contracts) |
 | v0.8.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` |
 | v0.8.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0-cyanoptera` |

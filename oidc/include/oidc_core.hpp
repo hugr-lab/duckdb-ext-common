@@ -62,6 +62,7 @@ struct Endpoints {
 	std::string token_endpoint;
 	std::string device_authorization_endpoint; // may be empty: not every issuer offers RFC 8628
 	std::string authorization_endpoint;        // may be empty: a machine-only issuer has no browser flow
+	std::string revocation_endpoint;           // may be empty: RFC 7009 not offered (spec 011)
 	std::string error;                         // non-empty when discovery failed
 
 	bool Ok() const {
@@ -122,9 +123,20 @@ TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const 
 TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                     const std::string &assertion, const std::string &scope, bool with_refresh = false);
 
-//! grant_type=refresh_token — silent renewal off a previous TokenSet.
+//! grant_type=refresh_token — silent renewal off a previous TokenSet. `scope`, when given, is sent (RFC 6749
+//! §6): one refresh token then serves another resource the IdP lets it reach (spec 011, single sign-on).
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
-                      const std::string &refresh_token);
+                      const std::string &refresh_token, const std::string &scope = "");
+
+//! RFC 7009: ask the issuer to revoke a token (a refresh token by default). ok when the issuer answered 200 -
+//! which it does for a token it no longer knows, too. The token never reaches the error.
+struct RevokeResult {
+	bool ok = false;
+	std::string error;
+	std::string error_code;
+};
+RevokeResult Revoke(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                    const std::string &token, const std::string &token_type_hint = "refresh_token");
 
 //! The device flow's first half (RFC 8628 §3.1-3.2): what to show the user.
 struct DeviceAuthorization {

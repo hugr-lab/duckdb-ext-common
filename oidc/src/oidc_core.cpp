@@ -432,6 +432,7 @@ Endpoints ParseDiscoveryDocument(const std::string &issuer, const HttpResult &re
 	out.token_endpoint = json.Str("token_endpoint");
 	out.device_authorization_endpoint = json.Str("device_authorization_endpoint");
 	out.authorization_endpoint = json.Str("authorization_endpoint");
+	out.revocation_endpoint = json.Str("revocation_endpoint");
 	if (out.token_endpoint.empty()) {
 		out.error = "discovery document carries no token_endpoint";
 		return out;
@@ -439,8 +440,8 @@ Endpoints ParseDiscoveryDocument(const std::string &issuer, const HttpResult &re
 	// an https issuer whose document names a cleartext endpoint is a downgrade: the credentials the
 	// flows POST must not travel weaker than the discovery did (the review's finding)
 	if (issuer.rfind("https://", 0) == 0) {
-		for (const auto *endpoint :
-		     {&out.token_endpoint, &out.device_authorization_endpoint, &out.authorization_endpoint}) {
+		for (const auto *endpoint : {&out.token_endpoint, &out.device_authorization_endpoint,
+		                             &out.authorization_endpoint, &out.revocation_endpoint}) {
 			if (!endpoint->empty() && endpoint->rfind("https://", 0) != 0) {
 				out.error = "discovery names a cleartext endpoint for an https issuer - refused: " + *endpoint;
 				return out;
@@ -574,16 +575,52 @@ TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std
 }
 
 TokenSet RefreshGrant(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
-                      const std::string &refresh_token) {
+                      const std::string &refresh_token, const std::string &scope) {
 	std::map<std::string, std::string> params {
 	    {"grant_type", "refresh_token"}, {"client_id", client_id}, {"refresh_token", refresh_token}};
 	if (!client_secret.empty()) {
 		params["client_secret"] = client_secret;
 	}
+	if (!scope.empty()) {
+		params["scope"] = scope;
+	}
 	auto out = PostGrant(ep, params);
 	if (!out.Ok()) {
 		Redact(out.error, refresh_token); // a refresh token lives long: never in an error either
 	}
+	return out;
+}
+
+RevokeResult Revoke(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
+                    const std::string &token, const std::string &token_type_hint) {
+	RevokeResult out;
+	if (ep.revocation_endpoint.empty()) {
+		out.error = "the issuer advertises no revocation_endpoint (RFC 7009 not offered)";
+		return out;
+	}
+	std::map<std::string, std::string> params {{"token", token}, {"client_id", client_id}};
+	if (!token_type_hint.empty()) {
+		params["token_type_hint"] = token_type_hint;
+	}
+	if (!client_secret.empty()) {
+		params["client_secret"] = client_secret;
+	}
+	auto response = HttpPostForm(ep.revocation_endpoint, params);
+	if (response.Ok()) {
+		out.ok = true;
+		return out;
+	}
+	if (!response.error.empty()) {
+		out.error = response.error;
+	} else {
+		Json json(response.body);
+		out.error_code = Printable(json.Str("error").substr(0, 64));
+		auto description = Printable(json.Str("error_description"));
+		out.error = out.error_code.empty()
+		                ? ("HTTP " + std::to_string(response.status) + " from the revocation endpoint")
+		                : (out.error_code + (description.empty() ? "" : (": " + description)));
+	}
+	Redact(out.error, token);
 	return out;
 }
 
