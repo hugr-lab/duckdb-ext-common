@@ -91,9 +91,58 @@ struct TokenSet {
 	}
 };
 
+//! How a confidential client proves itself at a token endpoint (spec 012). The first given of:
+//! - `private_key_pem` (private_key_jwt, RFC 7523 §2.2): an assertion signed here for each request, its `aud`
+//!   the token endpoint it goes to (or `assertion_audience`: Auth0 wants its issuer URL); `key_id` sets the
+//!   header's kid, `certificate_pem` adds x5t / x5t#S256;
+//! - `assertion` (a federated client assertion): a JWT the platform issued - a Kubernetes service-account
+//!   token, GitHub Actions' OIDC token - presented as is;
+//! - `client_secret` (client_secret_post).
+//! Signing needs a TLS build (OpenSSL). Nothing of a key, a certificate, an assertion or a secret reaches an
+//! error: what the caller presented is cut out of the IdP's answer before it is read.
+struct ClientAuth {
+	std::string client_id;
+	std::string client_secret;
+	std::string private_key_pem;
+	std::string key_id;
+	std::string certificate_pem;
+	std::string assertion_audience;
+	std::string assertion;
+};
+
+//! RFC 7523: a client assertion - iss = sub = client_id, aud = `audience` (the token endpoint), jti random,
+//! iat now, exp now + 300 s (no nbf: an IdP whose clock runs behind must not see it as not yet valid) - signed
+//! RS256 (an RSA key of 2048 bits or more) or ES256 (a P-256 key, nothing else). An encrypted key is refused.
+struct SignedAssertion {
+	std::string jwt;
+	std::string error;
+};
+SignedAssertion SignClientAssertion(const std::string &client_id, const std::string &audience,
+                                    const std::string &private_key_pem, const std::string &key_id = "",
+                                    const std::string &certificate_pem = "");
+
 //! grant_type=client_credentials — the machine identity flow.
 TokenSet ClientCredentials(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                            const std::string &scope = "");
+//! ... with any ClientAuth, and extra parameters (`audience` for Auth0-style IdPs, spec 012).
+TokenSet ClientCredentials(const Endpoints &ep, const ClientAuth &auth, const std::string &scope = "",
+                           const std::map<std::string, std::string> &extra = {});
+
+//! Azure managed identity (spec 012): a token for `resource` from the platform itself. App Service, Functions
+//! and Container Apps: IDENTITY_ENDPOINT + IDENTITY_HEADER (a loopback or link-local literal address only);
+//! elsewhere IMDS. Service Fabric (a remote https endpoint) and Azure Arc (a challenge flow) are not supported:
+//! refused, or answered by IMDS's absence. No retry: a VM still booting answers the caller's next attempt.
+struct ManagedIdentity {
+	std::string resource;                        // the app ID URI (or client id) the token is for
+	std::string client_id;                       // a user-assigned identity; empty: the system-assigned one
+	std::string imds = "http://169.254.169.254"; // loopback or link-local only (tests point it at a fake)
+};
+TokenSet ManagedIdentityToken(const ManagedIdentity &identity, int timeout_seconds = 5);
+
+//! GitHub Actions' OIDC token for `audience` (spec 012): ACTIONS_ID_TOKEN_REQUEST_URL (https, or loopback) and
+//! ACTIONS_ID_TOKEN_REQUEST_TOKEN from the job's environment. The token comes back as access_token, its expiry
+//! read from the JWT's own `exp`.
+TokenSet GithubActionsToken(const std::string &audience, int timeout_seconds = 10);
 
 //! grant_type=password — the resource-owner flow; only where the IdP and the
 //! admin allow it (design/016: an admin-enabled row of the menu, never forced).
@@ -115,6 +164,10 @@ TokenSet PasswordGrant(const Endpoints &ep, const std::string &client_id, const 
 TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                        const std::string &subject_token, const std::string &audience, const std::string &scope = "",
                        const std::string &resource = "", bool with_refresh = false);
+//! ... as a client that proves itself with any ClientAuth (spec 012).
+TokenSet TokenExchange(const Endpoints &ep, const ClientAuth &auth, const std::string &subject_token,
+                       const std::string &audience, const std::string &scope = "", const std::string &resource = "",
+                       bool with_refresh = false);
 
 //! Entra's On-Behalf-Of (RFC 7523 jwt-bearer, requested_token_use=on_behalf_of): `assertion` is the
 //! access token the client received, `scope` names the downstream API (api://.../.default). Both required;
@@ -122,6 +175,9 @@ TokenSet TokenExchange(const Endpoints &ep, const std::string &client_id, const 
 //! `scope` includes offline_access); without offline_access there is none - an empty refresh_token.
 TokenSet OnBehalfOf(const Endpoints &ep, const std::string &client_id, const std::string &client_secret,
                     const std::string &assertion, const std::string &scope, bool with_refresh = false);
+//! ... as a client that proves itself with any ClientAuth (spec 012: Entra OBO with a certificate).
+TokenSet OnBehalfOf(const Endpoints &ep, const ClientAuth &auth, const std::string &assertion, const std::string &scope,
+                    bool with_refresh = false);
 
 //! grant_type=refresh_token — silent renewal off a previous TokenSet. `scope`, when given, is sent (RFC 6749
 //! §6): one refresh token then serves another resource the IdP lets it reach (spec 011, single sign-on).
@@ -153,7 +209,8 @@ struct DeviceAuthorization {
 	}
 };
 
-DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope = "");
+DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_id, const std::string &scope = "",
+                                const std::map<std::string, std::string> &extra = {});
 
 //! The parsers behind the exchanges above, over a response already received:
 //! pure functions of the bytes an IdP answered, which is what the fuzz target
@@ -196,7 +253,8 @@ struct AuthorizationRequest {
 };
 
 AuthorizationRequest BuildAuthorizationRequest(const Endpoints &ep, const std::string &client_id,
-                                               const std::string &redirect_uri, const std::string &scope = "");
+                                               const std::string &redirect_uri, const std::string &scope = "",
+                                               const std::map<std::string, std::string> &extra = {});
 
 //! grant_type=authorization_code with the PKCE verifier - a public client, no secret.
 TokenSet ExchangeAuthorizationCode(const Endpoints &ep, const std::string &client_id, const std::string &code,
@@ -246,7 +304,8 @@ private:
 //! the IdP's error code (access_denied, ...), expired_token at the deadline, cancelled.
 TokenSet AuthorizationCodeLogin(const Endpoints &ep, const std::string &client_id, const std::string &scope,
                                 const std::function<void(const std::string &url)> &present,
-                                int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled = nullptr);
+                                int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled = nullptr,
+                                const std::map<std::string, std::string> &extra = {});
 
 //! The cache: keyed by an owner pointer (a DatabaseInstance, a provider, ...)
 //! plus a caller-chosen key; a token is served only while it has more than

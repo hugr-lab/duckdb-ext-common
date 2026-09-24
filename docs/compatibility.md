@@ -23,3 +23,6 @@ share has the same `CONTRACT_VERSION` in both.
 | v0.8.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 010: the `keychain/` module; spec 011: `oidc/` revokes and refreshes for a scope - modules, not contracts) |
 | v0.8.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` |
 | v0.8.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0-cyanoptera` |
+| v0.9.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 012: `oidc/` - client assertions, managed identity, an audience parameter; a module, not a contract) |
+| v0.9.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` |
+| v0.9.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0-cyanoptera` |
