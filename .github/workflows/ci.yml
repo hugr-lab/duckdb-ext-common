@@ -149,6 +149,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: cmd
         run: >
-          cl /nologo /std:c++17 /EHsc /W4 /WX /DDUCKDB_EXT_COMMON_KEYCHAIN_NAMESPACE=ext_common /Ikeychain\include
+          cl /nologo /std:c++17 /EHsc /W4 /WX /D_CRT_SECURE_NO_WARNINGS /DDUCKDB_EXT_COMMON_KEYCHAIN_NAMESPACE=ext_common /Ikeychain\include
           keychain\test\test_keychain.cpp keychain\src\keychain.cpp advapi32.lib /Fe:test_keychain_msvc.exe
           && test_keychain_msvc.exe
