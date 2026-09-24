@@ -16,3 +16,6 @@ share has the same `CONTRACT_VERSION` in both.
 | v0.5.0 | `acl_connection` (unchanged) | `ACLC` | 1 | duckdb-acl | `v2.0-cyanoptera` |
 | v0.6.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` |
 | v0.6.0 | `acl_connection` | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` (spec 007: the publisher mark on `AclSessionHooks`) |
+| v0.7.0 | `acl_audit` (unchanged) | `ACLA` | 2 | duckdb-acl | `v2.0-cyanoptera` |
+| v0.7.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` |
+| v0.7.0 | `tresor_audit` (`contracts/tresor_audit.hpp`, new, on `hooks/ext_hooks.hpp`) | `TRSA` | 1 | tresor | `v2.0-cyanoptera` (spec 008) |

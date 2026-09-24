@@ -9,7 +9,7 @@ Contents (charter, "Initial contents"):
 | Header | Producer | Consumers | Arrives with |
 | --- | --- | --- | --- |
 | `acl_audit.hpp` + `acl_principal.hpp` | duckdb-acl | acl-otel | **spec 002** — moved as is, magic `ACLA`, version 2, no bump; `Principal` is part of the layout |
-| `tresor_audit.hpp` | tresor | acl-otel | the tresor bootstrap, on top of `hooks/` |
+| `tresor_audit.hpp` | tresor | acl-otel | **spec 008** - magic `TRSA`, version 1, on `hooks/ext_hooks.hpp`: `TresorAuditEvent` (logins, secret lookups, refreshes, management, an acl session's delegation grant; with the statement's trace context) and `TresorAuditHooks` |
 | `acl_connection.hpp` | duckdb-acl | tresor | **spec 005** - magic `ACLC`, version 2 (spec 007: the publisher mark): `AclConnection` (the session of the running statement, per connection) and `AclSessionHooks` (session open/close observers) |
 
 Namespace: `duckdb::<producer>` (`duckdb::acl`, `duckdb::tresor`).
