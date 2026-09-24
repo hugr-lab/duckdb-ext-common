@@ -53,8 +53,8 @@ KeychainResult KeychainRemove(const std::string &service, const std::string &acc
 - **The secret** is bytes the module never logs. Error texts name the store and its status code, never
   the secret or the account's content beyond what the caller passed.
 - **Memory.** The module overwrites its own copies of the secret before freeing them. The platform
-  APIs' buffers are freed with their own free functions (`SecKeychainItemFreeContent`, `CredFree`,
-  `secret_password_free`, which wipes).
+  APIs' buffers are freed with their own functions: `CFRelease` on macOS, `CredFree` after
+  `SecureZeroMemory` on Windows, `secret_password_free` (which wipes) on Linux.
 
 ### Platforms
 
@@ -65,8 +65,8 @@ KeychainResult KeychainRemove(const std::string &service, const std::string &acc
     one (which needs an entitlement).
   - There, items are local by nature: iCloud synchronises only data-protection items marked
     synchronizable.
-  - The item's access list is the creating binary. The consumer links `-framework Security -framework
-  CoreFoundation`.
+  - The item's access list is the creating binary.
+  - The consumer links `-framework Security -framework CoreFoundation`.
 - **Windows:** a `CRED_TYPE_GENERIC` credential with target `service/account`,
   `CRED_PERSIST_LOCAL_MACHINE` (the user's profile on this machine, not roaming). Links `advapi32`.
   A credential holds at most `CRED_MAX_CREDENTIAL_BLOB_SIZE` (2560) bytes; a longer secret is
@@ -114,7 +114,8 @@ KeychainResult KeychainRemove(const std::string &service, const std::string &acc
   - Windows CI: the runner's Credential Manager.
 - Linux without a Secret Service (`DBUS_SESSION_BUS_ADDRESS` unset): not available, with why, and
   no crash.
-- `check_headers.sh` covers the header.
+- The test compiles the header with the module, under a namespace of its own (`ext_common`).
+  `check_headers.sh` covers `hooks/` and `contracts/` only, as for `oidc/`.
 
 ## Compatibility
 
