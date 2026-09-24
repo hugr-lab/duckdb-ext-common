@@ -7,13 +7,18 @@
 // decision path, pushes it onto a bounded Delivery queue, and a delivery thread hands it to every sink.
 // A slow or failing sink costs a counted drop, never latency on the decision (R8).
 //
-//   using MyHooks = ext_common::Registry<MyEvent, MY_MAGIC, MY_VERSION>;   // in the contract header
-//   auto hooks = MyHooks::Reach(db.GetObjectCache(), "my_hooks", why);      // either side, any load order
-//   hooks->AddSink(my_sink);                                               // a consumer
+//   class MyHooks : public ext_common::Registry<MyEvent, MY_MAGIC, MY_VERSION> {   // the contract header
+//   public:
+//       static string ObjectType() { return "my_hooks"; }                         // the cache key
+//       string GetObjectType() override { return ObjectType(); }
+//   };
+//   auto hooks = MyHooks::ReachAs<MyHooks>(db.GetObjectCache(), why);   // either side, any load order
+//   hooks->AddSink(my_sink);                                            // a consumer
 //
-// Everything is header-only (R1): each side compiles its own copy, and the stamp - the first two data
-// members of the registry - is what keeps two copies from reading one object through two layouts. A
-// contract bumps its version on any change to what it lays out, this base included (R4).
+// Everything is header-only (R1): each side compiles its own copy, and the stamp - the first data members
+// of the registry: the contract's magic and version, and this base's version - is what keeps two copies
+// from reading one object through two layouts. A contract bumps its version on any change to what it lays
+// out (R4); a change to this base bumps EXT_HOOKS_VERSION, which every registry carries and checks too.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -29,12 +34,16 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
 
 namespace duckdb {
 namespace ext_common {
+
+//! The layout of this base (Registry, Counters, Gauges, Sink): stamped in every registry, checked by ReachAs.
+constexpr int32_t EXT_HOOKS_VERSION = 1;
 
 //! One metric row, as a scrape wants it. Attributes only from bounded sets (R7).
 struct Metric {
@@ -46,10 +55,13 @@ struct Metric {
 	string description;
 };
 
+//! A key for an attribute tuple: each name and value length-prefixed, so no two tuples share one. Order counts
+//! - a producer names a metric's attributes in one fixed order.
 inline string AttributesKey(const vector<std::pair<string, string>> &attributes) {
 	string key;
 	for (auto &attribute : attributes) {
-		key += attribute.first + "=" + attribute.second + "\x1f";
+		key += std::to_string(attribute.first.size()) + ":" + attribute.first;
+		key += std::to_string(attribute.second.size()) + ":" + attribute.second;
 	}
 	return key;
 }
@@ -58,7 +70,7 @@ inline string AttributesKey(const vector<std::pair<string, string>> &attributes)
 class Counters {
 public:
 	void Add(const string &name, const vector<std::pair<string, string>> &attributes, int64_t delta = 1) {
-		auto key = name + "\x1f" + AttributesKey(attributes);
+		auto key = AttributesKey({{name, string()}}) + AttributesKey(attributes);
 		std::lock_guard<std::mutex> guard(lock);
 		auto entry = values.find(key);
 		if (entry == values.end()) {
@@ -69,7 +81,7 @@ public:
 		}
 	}
 	int64_t Get(const string &name, const vector<std::pair<string, string>> &attributes) const {
-		auto key = name + "\x1f" + AttributesKey(attributes);
+		auto key = AttributesKey({{name, string()}}) + AttributesKey(attributes);
 		std::lock_guard<std::mutex> guard(lock);
 		auto entry = values.find(key);
 		return entry == values.end() ? 0 : entry->second;
@@ -96,36 +108,48 @@ private:
 	std::map<string, std::pair<string, vector<std::pair<string, string>>>> keys;
 };
 
-//! Gauges: states, read at snapshot time through the reader the owner of the state registered. An owner
-//! whose state goes away removes its readers first, so a snapshot never calls into freed memory.
+//! Gauges: states, read at snapshot time through the reader the owner of the state registered. Readers run
+//! under the gauges' lock, so once Remove returns its reader never runs again and the owner may free the
+//! state: a reader must be cheap (an atomic load, a size under the owner's own short lock) and must not
+//! call back into these gauges.
 class Gauges {
 public:
 	using Reader = std::function<int64_t()>;
 
+	//! One gauge per (name, attributes): registering it again replaces the reader.
 	void Register(const string &name, const vector<std::pair<string, string>> &attributes, const string &unit,
 	              const string &description, Reader reader) {
 		std::lock_guard<std::mutex> guard(lock);
+		for (auto &entry : entries) {
+			if (entry.name == name && entry.attributes == attributes) {
+				entry.unit = unit;
+				entry.description = description;
+				entry.reader = std::move(reader);
+				return;
+			}
+		}
 		entries.push_back(Entry {name, attributes, unit, description, std::move(reader)});
 	}
-	void Remove(const string &name) {
+	void Remove(const string &name, const vector<std::pair<string, string>> &attributes) {
 		std::lock_guard<std::mutex> guard(lock);
 		for (auto it = entries.begin(); it != entries.end();) {
-			it = it->name == name ? entries.erase(it) : it + 1;
+			it = it->name == name && it->attributes == attributes ? entries.erase(it) : it + 1;
 		}
 	}
+	//! A reader that throws is left out of this snapshot.
 	vector<Metric> Snapshot() const {
-		vector<Entry> copy;
-		{
-			std::lock_guard<std::mutex> guard(lock);
-			copy = entries;
-		}
+		std::lock_guard<std::mutex> guard(lock);
 		vector<Metric> out;
-		for (auto &entry : copy) {
+		for (auto &entry : entries) {
 			Metric metric;
 			metric.name = entry.name;
 			metric.kind = "gauge";
 			metric.attributes = entry.attributes;
-			metric.value = entry.reader();
+			try {
+				metric.value = entry.reader();
+			} catch (...) {
+				continue;
+			}
 			metric.unit = entry.unit;
 			metric.description = entry.description;
 			out.push_back(std::move(metric));
@@ -145,13 +169,15 @@ private:
 	vector<Entry> entries;
 };
 
-//! A consumer of events. Called on the producer's delivery thread, in `seq` order, never on the decision
-//! path; an exception is caught, counted and skipped for that event.
+//! A consumer of events. Called on the producer's delivery thread, in the order the producer pushed them,
+//! never on the decision path; an exception is caught, counted and skipped for that event. The delivery
+//! thread holds its own reference: OnEvent may still be running, or run once more, after RemoveSink
+//! returns - a sink owns (by shared_ptr) everything it touches.
 template <class Event>
 struct Sink {
 	virtual ~Sink() = default;
 	virtual void OnEvent(const Event &event) = 0;
-	//! Called when the producer stops, and whenever it flushes.
+	//! Called when the producer's delivery stops, after the last event.
 	virtual void Flush() {
 	}
 };
@@ -163,6 +189,7 @@ class Registry : public ObjectCacheEntry {
 public:
 	int32_t contract_magic = MAGIC;
 	int32_t contract_version = VERSION;
+	int32_t hooks_version = EXT_HOOKS_VERSION;
 
 	static constexpr int32_t CONTRACT_MAGIC = MAGIC;
 	static constexpr int32_t CONTRACT_VERSION = VERSION;
@@ -172,10 +199,12 @@ public:
 		return optional_idx();
 	}
 
-	//! The registry of an instance under `key`, created when absent (either side, any load order) and
-	//! checked: null with `why` when the object under the key is stamped with another magic or version.
+	//! The registry of an instance under Derived::ObjectType(), created when absent (either side, any load
+	//! order) and checked: null with `why` when the object under the key is of another type (the cache
+	//! compares type names before any cast) or stamped with another magic or version.
 	template <class Derived>
-	static shared_ptr<Derived> ReachAs(ObjectCache &cache, const string &key, string &why) {
+	static shared_ptr<Derived> ReachAs(ObjectCache &cache, string &why) {
+		auto key = Derived::ObjectType();
 		auto registry = cache.GetOrCreate<Derived>(key);
 		if (!registry) {
 			why = "the object cache holds something else under '" + key + "'";
@@ -189,6 +218,12 @@ public:
 			why = "the registry under '" + key + "' is stamped with contract version " +
 			      std::to_string(registry->contract_version) + ", this build speaks " + std::to_string(VERSION) +
 			      " - the two sides were built from different revisions of the contract";
+			return nullptr;
+		}
+		if (registry->hooks_version != EXT_HOOKS_VERSION) {
+			why = "the registry under '" + key + "' is built on hooks base version " +
+			      std::to_string(registry->hooks_version) + ", this build on " + std::to_string(EXT_HOOKS_VERSION) +
+			      " - the two sides were built from different revisions of duckdb-ext-common";
 			return nullptr;
 		}
 		why.clear();
@@ -232,18 +267,23 @@ private:
 	Gauges gauges;
 };
 
-//! The producer's side of delivery: a bounded queue and one thread that hands each event to the sinks the
-//! `sinks` function returns (and to `local`, the producer's own sink - a log - if any). Push never blocks:
-//! a full queue drops the event and counts it. Owned by the producer, in its own image (R1).
+//! The producer's side of delivery: a bounded queue and one thread that hands each event, in push order, to
+//! the sinks the `sinks` function returns. Push never blocks: a full queue drops the event and counts it.
+//! Nothing that goes wrong on the delivery thread leaves it (R8). Owned by the producer, in its own image
+//! (R1), and stopped by it - from one thread, never from a static at process exit. A producer that stamps
+//! a sequence number does so under its own lock around Push, so the numbers arrive in order.
 template <class Event>
 class Delivery {
 public:
 	using SinksOf = std::function<vector<shared_ptr<Sink<Event>>>()>;
 	using Count = std::function<void(const string &what)>; // "dropped", "sink_failed"
 
-	Delivery(size_t capacity_p, SinksOf sinks_p, Count count_p)
-	    : capacity(capacity_p), sinks(std::move(sinks_p)), count(std::move(count_p)) {
-		worker = std::thread([this]() { Run(); });
+	Delivery(size_t capacity, SinksOf sinks, Count count) : state(std::make_shared<State>()) {
+		state->capacity = capacity;
+		state->sinks = std::move(sinks);
+		state->count = std::move(count);
+		auto shared = state; // the thread owns the state too: it may outlive this object (Stop from a sink)
+		worker = std::thread([shared]() { Run(*shared); });
 	}
 	~Delivery() {
 		Stop();
@@ -253,33 +293,90 @@ public:
 
 	//! Queue an event; false (and counted) when the queue is full or delivery has stopped.
 	bool Push(Event event) {
+		bool accepted = false;
 		{
-			std::lock_guard<std::mutex> guard(lock);
-			if (stopping || queue.size() >= capacity) {
-				if (count) {
-					count("dropped");
-				}
-				return false;
+			std::lock_guard<std::mutex> guard(state->lock);
+			if (!state->stopping && state->queue.size() < state->capacity) {
+				state->queue.push_back(std::move(event));
+				accepted = true;
 			}
-			queue.push_back(std::move(event));
 		}
-		ready.notify_one();
-		return true;
+		if (accepted) {
+			state->ready.notify_one();
+		} else {
+			Tally(*state, "dropped");
+		}
+		return accepted;
 	}
-	//! Deliver what is queued, then stop the thread and flush the sinks. Idempotent.
+	//! Deliver what is queued, then stop the thread and flush the sinks. Idempotent. Called from a sink (on
+	//! the delivery thread) it does not wait: the thread delivers what is queued, flushes and ends on its own.
 	void Stop() {
 		{
-			std::lock_guard<std::mutex> guard(lock);
-			if (stopping) {
+			std::lock_guard<std::mutex> guard(state->lock);
+			if (state->stopping) {
 				return;
 			}
-			stopping = true;
+			state->stopping = true;
 		}
-		ready.notify_all();
-		if (worker.joinable()) {
-			worker.join();
+		state->ready.notify_all();
+		if (!worker.joinable()) {
+			return;
 		}
-		for (auto &sink : sinks()) {
+		if (worker.get_id() == std::this_thread::get_id()) {
+			worker.detach();
+			return;
+		}
+		worker.join();
+	}
+
+private:
+	struct State {
+		size_t capacity = 0;
+		SinksOf sinks;
+		Count count;
+		std::mutex lock;
+		std::condition_variable ready;
+		std::deque<Event> queue;
+		bool stopping = false;
+	};
+
+	static vector<shared_ptr<Sink<Event>>> Current(State &state) {
+		try {
+			return state.sinks ? state.sinks() : vector<shared_ptr<Sink<Event>>>();
+		} catch (...) {
+			return vector<shared_ptr<Sink<Event>>>();
+		}
+	}
+	static void Tally(State &state, const string &what) {
+		try {
+			if (state.count) {
+				state.count(what);
+			}
+		} catch (...) {
+		}
+	}
+	//! The delivery thread: every queued event to every sink, until stopped and drained; then the flush.
+	static void Run(State &state) {
+		while (true) {
+			Event event;
+			{
+				std::unique_lock<std::mutex> guard(state.lock);
+				state.ready.wait(guard, [&]() { return state.stopping || !state.queue.empty(); });
+				if (state.queue.empty()) {
+					break;
+				}
+				event = std::move(state.queue.front());
+				state.queue.pop_front();
+			}
+			for (auto &sink : Current(state)) {
+				try {
+					sink->OnEvent(event);
+				} catch (...) {
+					Tally(state, "sink_failed");
+				}
+			}
+		}
+		for (auto &sink : Current(state)) {
 			try {
 				sink->Flush();
 			} catch (...) {
@@ -287,38 +384,7 @@ public:
 		}
 	}
 
-private:
-	void Run() {
-		while (true) {
-			Event event;
-			{
-				std::unique_lock<std::mutex> guard(lock);
-				ready.wait(guard, [&]() { return stopping || !queue.empty(); });
-				if (queue.empty()) {
-					return;
-				}
-				event = std::move(queue.front());
-				queue.pop_front();
-			}
-			for (auto &sink : sinks()) {
-				try {
-					sink->OnEvent(event);
-				} catch (...) {
-					if (count) {
-						count("sink_failed");
-					}
-				}
-			}
-		}
-	}
-
-	size_t capacity;
-	SinksOf sinks;
-	Count count;
-	std::mutex lock;
-	std::condition_variable ready;
-	std::deque<Event> queue;
-	bool stopping = false;
+	shared_ptr<State> state;
 	std::thread worker;
 };
 

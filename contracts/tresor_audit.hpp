@@ -9,6 +9,10 @@
 //   auto hooks = TresorAuditHooks::Reach(db.GetObjectCache(), why);   // either side, any load order
 //   if (hooks) { hooks->AddSink(my_sink); }                            // a consumer
 //
+// Metrics: `tresor.events` {kind, outcome, cached} counts every event (a lookup served from tresor's cache
+// is counted with cached=true and not emitted); `tresor.audit.dropped` / `tresor.audit.sink_failed` count
+// delivery's losses. No other field is ever a metric attribute.
+//
 // tresor composes an event only while a sink is registered (or its own log is on), and delivers it on its
 // own thread (R8). An event never carries secret material, credentials, tokens, session handles or
 // delegation grant ids, nor statement text (R7): a secret's NAME, type and service, the outcome and a
@@ -35,11 +39,13 @@ namespace tresor {
 //!                  unauthenticated, service_unavailable, transport, invalid, no_grant, other
 struct TresorAuditEvent {
 	int64_t ts_us = 0; // when it ended (unix microseconds)
-	int64_t seq = 0;   // per instance, increasing
+	int64_t seq = 0;   // per instance, increasing, in delivery order
 	string kind;
 	string outcome;
 	string reason_code;
-	string reason; // tresor's own text: never a value, a token or a grant id
+	//! tresor's own words, composed from its fixed texts and names only - never the text of an exception,
+	//! of the service's or the IdP's answer, a value, a token or a grant id.
+	string reason;
 
 	string service; // the attached catalog (`corp`)
 	string host;    // the service it names (`secrets.corp:443/base`)
@@ -62,7 +68,7 @@ struct TresorAuditEvent {
 	string detail;            // session_grant: obtained / failed / revoked / rejected / expired
 };
 
-//! The registry: sinks, counters (bounded attributes only: kind, outcome) and gauges.
+//! The registry: sinks, counters (bounded attributes only: kind, outcome, cached) and gauges.
 class TresorAuditHooks : public ext_common::Registry<TresorAuditEvent, 0x54525341 /* "TRSA" */, 1> {
 public:
 	static string ObjectType() {
@@ -72,7 +78,7 @@ public:
 		return ObjectType();
 	}
 	static shared_ptr<TresorAuditHooks> Reach(ObjectCache &cache, string &why) {
-		return ReachAs<TresorAuditHooks>(cache, ObjectType(), why);
+		return ReachAs<TresorAuditHooks>(cache, why);
 	}
 };
 
