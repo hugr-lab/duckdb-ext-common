@@ -319,7 +319,7 @@ public:
 		dynamics.push_back(Dynamic {name, unit, description, std::move(reader)});
 	}
 	//! Drop every gauge of this name: an owner whose state is going away takes its readers with it,
-	//! so a later snapshot never calls into freed memory.
+	//! so a later snapshot never calls into freed memory - and a snapshot running now finishes first.
 	void Remove(const string &name) {
 		std::lock_guard<std::mutex> guard(lock);
 		for (auto it = entries.begin(); it != entries.end();) {
@@ -329,14 +329,14 @@ public:
 			it = it->name == name ? dynamics.erase(it) : it + 1;
 		}
 	}
+	//! The readers run under the registry's lock (spec 009): a Remove() waits for a snapshot that is
+	//! calling the reader it removes, so once it returns the owner may free what the reader touches.
+	//! A reader therefore must not call back into the gauges, nor take a lock that is held while
+	//! Register() / Remove() are called.
 	vector<AuditMetric> Snapshot() const {
-		vector<Entry> fixed;
-		vector<Dynamic> dynamic;
-		{
-			std::lock_guard<std::mutex> guard(lock);
-			fixed = entries;
-			dynamic = dynamics;
-		}
+		std::lock_guard<std::mutex> guard(lock);
+		auto &fixed = entries;
+		auto &dynamic = dynamics;
 		vector<AuditMetric> out;
 		for (auto &entry : fixed) {
 			AuditMetric metric;
