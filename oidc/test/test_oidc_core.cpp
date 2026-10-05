@@ -674,6 +674,50 @@ int main() {
 		      "a canonical trailing slash in the advertised issuer is normalised, not refused: " + slashy.error);
 	});
 
+	Scenario("a consumer's transport carries every request (spec 013)", [&] {
+		std::vector<std::string> seen;
+		auto recorder = [&](const std::string &method, const std::string &url,
+		                    const std::map<std::string, std::string> &, const std::string &body,
+		                    const std::string &content_type, int) {
+			seen.push_back(method + " " + url + " " + content_type + " " + body);
+			HttpResult out;
+			out.status = 418;
+			out.body = "{}";
+			return out;
+		};
+		{
+			TransportScope scope(recorder);
+			auto got = HttpGet(idp.Issuer() + "/x");
+			Check(got.status == 418 && seen.size() == 1 && seen[0].rfind("GET ", 0) == 0,
+			      "a GET goes through the scope's transport, never the network");
+			HttpPostForm(idp.Issuer() + "/token", {{"a", "b c"}});
+			Check(seen.size() == 2 && seen[1].find("application/x-www-form-urlencoded a=b%20c") != std::string::npos,
+			      "a form POST arrives encoded, with its content type: " + seen[1]);
+			// the module's own requests too: discovery inside a call
+			auto ep2 = Discover(idp.Issuer());
+			Check(!ep2.Ok() && seen.size() == 3 && seen[2].find("/.well-known/openid-configuration") != std::string::npos,
+			      "discovery goes through it as well");
+			{
+				TransportScope inner(nullptr);
+				Check(HttpGet(idp.Issuer() + "/.well-known/openid-configuration").status == 200 && seen.size() == 3,
+				      "an empty inner scope is the built-in client again");
+			}
+			HttpGet(idp.Issuer() + "/y");
+			Check(seen.size() == 4, "the outer scope is restored after the inner one");
+			std::thread other([&] {
+				Check(HttpGet(idp.Issuer() + "/.well-known/openid-configuration").status == 200,
+				      "another thread does not see this thread's scope");
+			});
+			other.join();
+		}
+		Check(Discover(idp.Issuer()).Ok() && seen.size() == 4, "after the scope: the built-in client");
+		SetDefaultTransport(recorder);
+		HttpGet(idp.Issuer() + "/z");
+		Check(seen.size() == 5, "the process's default transport, where no scope is set");
+		SetDefaultTransport(nullptr);
+		Check(Discover(idp.Issuer()).Ok() && seen.size() == 5, "an empty default is the built-in client");
+	});
+
 	Scenario("revocation (RFC 7009, spec 011)", [&] {
 		Check(ep.revocation_endpoint == idp.Issuer() + "/revoke", "the revocation endpoint is discovered");
 		auto revoked = Revoke(ep, "cli", "", "rt-gone");

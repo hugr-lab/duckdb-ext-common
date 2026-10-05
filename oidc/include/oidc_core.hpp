@@ -56,6 +56,28 @@ HttpResult HttpSend(const std::string &method, const std::string &url,
                     const std::map<std::string, std::string> &headers, const std::string &body = "",
                     const std::string &content_type = "", int timeout_seconds = 30);
 
+//! A transport that carries this module's requests instead of its own httplib client (spec 013): the
+//! consumer's, such as DuckDB's HTTPUtil - in a wasm build, the browser's fetch through httpfs. It gets each
+//! request as HttpSend does, a GET and a form POST included.
+using Transport = std::function<HttpResult(const std::string &method, const std::string &url,
+                                           const std::map<std::string, std::string> &headers,
+                                           const std::string &body, const std::string &content_type,
+                                           int timeout_seconds)>;
+//! The process's transport where no scope sets one; empty (the default) is the built-in client.
+void SetDefaultTransport(Transport transport);
+//! The calling thread's transport while this lives: every request made on the thread, the module's own
+//! included (a token refresh inside a consumer's call). Scopes nest; the previous one is restored.
+class TransportScope {
+public:
+	explicit TransportScope(Transport transport);
+	~TransportScope();
+	TransportScope(const TransportScope &) = delete;
+	TransportScope &operator=(const TransportScope &) = delete;
+
+private:
+	std::shared_ptr<Transport> previous;
+};
+
 //! The issuer's endpoints, discovered or assembled by the caller.
 struct Endpoints {
 	std::string issuer;

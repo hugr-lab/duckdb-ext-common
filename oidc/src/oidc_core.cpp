@@ -426,22 +426,25 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 	return out;
 }
 
-HttpResult HttpGet(const std::string &url, int timeout_seconds) {
-	auto parts = ParseUrl(url);
-	return Run(parts, timeout_seconds, [&](auto &client) { return client.Get(parts.path.c_str()); });
+namespace {
+
+// the transport in force (spec 013): the calling thread's scope, else the process's default, else none
+std::mutex default_transport_lock;
+std::shared_ptr<Transport> default_transport;
+thread_local std::shared_ptr<Transport> scoped_transport;
+
+std::shared_ptr<Transport> CurrentTransport() {
+	if (scoped_transport) {
+		return scoped_transport;
+	}
+	std::lock_guard<std::mutex> guard(default_transport_lock);
+	return default_transport;
 }
 
-HttpResult HttpPostForm(const std::string &url, const std::map<std::string, std::string> &params, int timeout_seconds) {
-	auto parts = ParseUrl(url);
-	auto body = FormEncode(params);
-	return Run(parts, timeout_seconds, [&](auto &client) {
-		return client.Post(parts.path.c_str(), body, "application/x-www-form-urlencoded");
-	});
-}
-
-HttpResult HttpSend(const std::string &method, const std::string &url,
-                    const std::map<std::string, std::string> &headers, const std::string &body,
-                    const std::string &content_type, int timeout_seconds) {
+//! The built-in client: httplib, TLS where the build has it.
+HttpResult BuiltInSend(const std::string &method, const std::string &url,
+                       const std::map<std::string, std::string> &headers, const std::string &body,
+                       const std::string &content_type, int timeout_seconds) {
 	auto parts = ParseUrl(url);
 	hl::Headers request_headers;
 	for (auto &header : headers) {
@@ -458,6 +461,38 @@ HttpResult HttpSend(const std::string &method, const std::string &url,
 		}
 		return client.send(request);
 	});
+}
+
+} // namespace
+
+void SetDefaultTransport(Transport transport) {
+	std::lock_guard<std::mutex> guard(default_transport_lock);
+	default_transport = transport ? std::make_shared<Transport>(std::move(transport)) : nullptr;
+}
+
+TransportScope::TransportScope(Transport transport) : previous(scoped_transport) {
+	scoped_transport = transport ? std::make_shared<Transport>(std::move(transport)) : nullptr;
+}
+
+TransportScope::~TransportScope() {
+	scoped_transport = std::move(previous);
+}
+
+HttpResult HttpSend(const std::string &method, const std::string &url,
+                    const std::map<std::string, std::string> &headers, const std::string &body,
+                    const std::string &content_type, int timeout_seconds) {
+	if (auto transport = CurrentTransport()) {
+		return (*transport)(method, url, headers, body, content_type, timeout_seconds);
+	}
+	return BuiltInSend(method, url, headers, body, content_type, timeout_seconds);
+}
+
+HttpResult HttpGet(const std::string &url, int timeout_seconds) {
+	return HttpSend("GET", url, {}, "", "", timeout_seconds);
+}
+
+HttpResult HttpPostForm(const std::string &url, const std::map<std::string, std::string> &params, int timeout_seconds) {
+	return HttpSend("POST", url, {}, FormEncode(params), "application/x-www-form-urlencoded", timeout_seconds);
 }
 
 Endpoints Discover(const std::string &issuer_url, int timeout_seconds) {
