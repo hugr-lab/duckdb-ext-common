@@ -24,6 +24,13 @@ The namespace is yours (charter R13): the header refuses to compile without
 says `acl`, tresor `tresor`. Every TU that includes `oidc_core.hpp` needs the definition, the
 standalone tests of your own included.
 
+## A transport of your own (spec 013)
+
+Every request goes through `HttpSend`, and through a consumer's transport when one is set: a
+`TransportScope` for the calling thread (the module's own requests inside the call included), or
+`SetDefaultTransport` for the process. A wasm consumer routes them through DuckDB's `HTTPUtil` (the
+browser's `fetch`), where sockets do not exist.
+
 ## Testing it
 
 ```sh

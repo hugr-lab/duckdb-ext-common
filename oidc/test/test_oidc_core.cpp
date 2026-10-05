@@ -674,6 +674,133 @@ int main() {
 		      "a canonical trailing slash in the advertised issuer is normalised, not refused: " + slashy.error);
 	});
 
+	Scenario("a consumer's transport carries every request (spec 013)", [&] {
+		std::vector<std::string> seen;
+		auto recorder = [&](const std::string &method, const std::string &url,
+		                    const std::map<std::string, std::string> &, const std::string &body,
+		                    const std::string &content_type, int) {
+			seen.push_back(method + " " + url + " " + content_type + " " + body);
+			HttpResult out;
+			out.status = 418;
+			out.body = "{}";
+			return out;
+		};
+		{
+			TransportScope scope(recorder);
+			auto got = HttpGet(idp.Issuer() + "/x");
+			Check(got.status == 418 && seen.size() == 1 && seen[0].rfind("GET ", 0) == 0,
+			      "a GET goes through the scope's transport, never the network");
+			HttpPostForm(idp.Issuer() + "/token", {{"a", "b c"}});
+			Check(seen.size() == 2 && seen[1].find("application/x-www-form-urlencoded a=b%20c") != std::string::npos,
+			      "a form POST arrives encoded, with its content type: " + seen[1]);
+			// the module's own requests too: discovery inside a call
+			auto ep2 = Discover(idp.Issuer());
+			Check(!ep2.Ok() && seen.size() == 3 &&
+			          seen[2].find("/.well-known/openid-configuration") != std::string::npos,
+			      "discovery goes through it as well");
+			{
+				TransportScope inner(nullptr);
+				Check(HttpGet(idp.Issuer() + "/.well-known/openid-configuration").status == 200 && seen.size() == 3,
+				      "an empty inner scope is the built-in client again");
+			}
+			HttpGet(idp.Issuer() + "/y");
+			Check(seen.size() == 4, "the outer scope is restored after the inner one");
+			std::thread other([&] {
+				Check(HttpGet(idp.Issuer() + "/.well-known/openid-configuration").status == 200,
+				      "another thread does not see this thread's scope");
+			});
+			other.join();
+		}
+		Check(Discover(idp.Issuer()).Ok() && seen.size() == 4, "after the scope: the built-in client");
+		SetDefaultTransport(recorder);
+		HttpGet(idp.Issuer() + "/z");
+		Check(seen.size() == 5, "the process's default transport, where no scope is set");
+		{
+			TransportScope over(recorder);
+			HttpGet(idp.Issuer() + "/w");
+			Check(seen.size() == 6, "a scope over a default: the scope's transport");
+			TransportScope empty(nullptr);
+			Check(HttpGet(idp.Issuer() + "/.well-known/openid-configuration").status == 200 && seen.size() == 6,
+			      "an empty scope is the built-in client, whatever the default");
+		}
+		SetDefaultTransport(nullptr);
+		Check(Discover(idp.Issuer()).Ok() && seen.size() == 6, "an empty default is the built-in client");
+
+		// what it is handed: headers and the timeout as given
+		std::map<std::string, std::string> got_headers;
+		int got_timeout = 0;
+		{
+			TransportScope scope([&](const std::string &, const std::string &,
+			                         const std::map<std::string, std::string> &h, const std::string &,
+			                         const std::string &, int timeout) {
+				got_headers = h;
+				got_timeout = timeout;
+				return HttpResult {};
+			});
+			HttpSend("GET", idp.Issuer() + "/h", {{"Authorization", "Bearer abc"}}, "", "", 7);
+		}
+		Check(got_headers.size() == 1 && got_headers["Authorization"] == "Bearer abc" && got_timeout == 7,
+		      "the headers and the timeout reach the transport as given");
+
+		// a transport's error that echoes the request: the module redacts what it sent
+		{
+			TransportScope scope([](const std::string &, const std::string &url,
+			                        const std::map<std::string, std::string> &headers, const std::string &body,
+			                        const std::string &, int) {
+				HttpResult out;
+				out.error = "failed " + url + " with " + body;
+				for (auto &h : headers) {
+					out.error += " " + h.first + ": " + h.second;
+				}
+				return out;
+			});
+			auto refreshed = RefreshGrant(ep, "cli", "the-client-secret", "rt-echoed-by/the transport", "");
+			Check(!refreshed.Ok() && refreshed.error.find("rt-echoed") == std::string::npos &&
+			          refreshed.error.find("the-client-secret") == std::string::npos &&
+			          refreshed.error.find("<redacted>") != std::string::npos,
+			      "neither the refresh token (encoded or not) nor the secret in the error: " + refreshed.error);
+			auto echoed =
+			    HttpSend("GET", idp.Issuer() + "/h", {{"authorization", "Bearer a-long-bearer-token"}}, "", "", 5);
+			Check(echoed.error.find("a-long-bearer-token") == std::string::npos,
+			      "nor the Authorization header's token: " + echoed.error);
+			auto plain =
+			    HttpSend("POST", idp.Issuer() + "/j", {}, "{\"secret\":\"json-body-value\"}", "application/json", 5);
+			Check(plain.error.find("json-body-value") == std::string::npos, "nor a body: " + plain.error);
+		}
+
+		// the module's rules hold whoever carries the request
+		{
+			int calls = 0;
+			TransportScope scope([&](const std::string &, const std::string &,
+			                         const std::map<std::string, std::string> &, const std::string &,
+			                         const std::string &, int) {
+				calls++;
+				HttpResult out;
+				out.status = 200;
+				out.body =
+				    "{\"issuer\":\"https://elsewhere.example\",\"token_endpoint\":\"https://elsewhere.example/t\"}";
+				return out;
+			});
+			Check(!HttpGet("ftp://host/x").error.empty() && calls == 0, "a URL that is not http(s): refused, not sent");
+			auto mismatch = Discover(idp.Issuer());
+			Check(!mismatch.Ok() && calls == 1,
+			      "a transport's discovery answer is checked: the issuer must match: " + mismatch.error);
+		}
+
+		// a transport that calls back into the module reaches the built-in client, not itself
+		{
+			int depth = 0;
+			TransportScope scope([&](const std::string &, const std::string &url,
+			                         const std::map<std::string, std::string> &, const std::string &,
+			                         const std::string &, int) {
+				depth++;
+				return HttpGet(url);
+			});
+			auto inner = HttpGet(idp.Issuer() + "/.well-known/openid-configuration");
+			Check(inner.status == 200 && depth == 1, "re-entry: one call through the transport, then the network");
+		}
+	});
+
 	Scenario("revocation (RFC 7009, spec 011)", [&] {
 		Check(ep.revocation_endpoint == idp.Issuer() + "/revoke", "the revocation endpoint is discovered");
 		auto revoked = Revoke(ep, "cli", "", "rt-gone");

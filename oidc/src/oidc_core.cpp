@@ -426,22 +426,75 @@ TokenSet ParseTokenResponse(const HttpResult &response) {
 	return out;
 }
 
-HttpResult HttpGet(const std::string &url, int timeout_seconds) {
-	auto parts = ParseUrl(url);
-	return Run(parts, timeout_seconds, [&](auto &client) { return client.Get(parts.path.c_str()); });
+namespace {
+
+// the transport in force (spec 013): the calling thread's scope, else the process's default, else none
+std::mutex default_transport_lock;
+std::shared_ptr<Transport> default_transport;
+thread_local std::shared_ptr<Transport> scoped_transport;
+
+thread_local bool in_transport = false; // a transport calling back into the module reaches the built-in client
+
+void Redact(std::string &error, const std::string &presented); // below, with the exchanges
+
+//! A consumer's error text may echo the request: never what it carried - the Authorization header's value
+//! (and its token), the form's values, or a body.
+void HideRequest(std::string &error, const std::map<std::string, std::string> &headers, const std::string &body,
+                 const std::string &content_type) {
+	for (auto &header : headers) {
+		std::string name = header.first;
+		std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return std::tolower(c); });
+		if (name == "authorization") {
+			Redact(error, header.second);
+			auto space = header.second.find(' ');
+			if (space != std::string::npos) {
+				Redact(error, header.second.substr(space + 1));
+			}
+		}
+	}
+	if (content_type == "application/x-www-form-urlencoded") {
+		size_t start = 0;
+		while (start <= body.size()) {
+			auto end = body.find('&', start);
+			auto pair = body.substr(start, end == std::string::npos ? std::string::npos : end - start);
+			auto equals = pair.find('=');
+			if (equals != std::string::npos) {
+				auto encoded = pair.substr(equals + 1);
+				Redact(error, encoded);
+				std::string decoded; // a transport may quote what it sent, or what it meant
+				for (size_t i = 0; i < encoded.size(); i++) {
+					if (encoded[i] == '%' && i + 2 < encoded.size() && std::isxdigit((unsigned char)encoded[i + 1]) &&
+					    std::isxdigit((unsigned char)encoded[i + 2])) {
+						decoded += char(std::stoi(encoded.substr(i + 1, 2), nullptr, 16));
+						i += 2;
+					} else {
+						decoded += encoded[i] == '+' ? ' ' : encoded[i];
+					}
+				}
+				Redact(error, decoded);
+			}
+			if (end == std::string::npos) {
+				break;
+			}
+			start = end + 1;
+		}
+	} else {
+		Redact(error, body);
+	}
 }
 
-HttpResult HttpPostForm(const std::string &url, const std::map<std::string, std::string> &params, int timeout_seconds) {
-	auto parts = ParseUrl(url);
-	auto body = FormEncode(params);
-	return Run(parts, timeout_seconds, [&](auto &client) {
-		return client.Post(parts.path.c_str(), body, "application/x-www-form-urlencoded");
-	});
+std::shared_ptr<Transport> CurrentTransport() {
+	if (scoped_transport) {
+		return scoped_transport;
+	}
+	std::lock_guard<std::mutex> guard(default_transport_lock);
+	return default_transport;
 }
 
-HttpResult HttpSend(const std::string &method, const std::string &url,
-                    const std::map<std::string, std::string> &headers, const std::string &body,
-                    const std::string &content_type, int timeout_seconds) {
+//! The built-in client: httplib, TLS where the build has it.
+HttpResult BuiltInSend(const std::string &method, const std::string &url,
+                       const std::map<std::string, std::string> &headers, const std::string &body,
+                       const std::string &content_type, int timeout_seconds) {
 	auto parts = ParseUrl(url);
 	hl::Headers request_headers;
 	for (auto &header : headers) {
@@ -458,6 +511,57 @@ HttpResult HttpSend(const std::string &method, const std::string &url,
 		}
 		return client.send(request);
 	});
+}
+
+} // namespace
+
+void SetDefaultTransport(Transport transport) {
+	std::lock_guard<std::mutex> guard(default_transport_lock);
+	default_transport = transport ? std::make_shared<Transport>(std::move(transport)) : nullptr;
+}
+
+TransportScope::TransportScope(Transport transport) : previous(scoped_transport) {
+	// an empty one is kept as such: the built-in client for this scope, whatever the default
+	scoped_transport = std::make_shared<Transport>(std::move(transport));
+}
+
+TransportScope::~TransportScope() {
+	scoped_transport = std::move(previous);
+}
+
+HttpResult HttpSend(const std::string &method, const std::string &url,
+                    const std::map<std::string, std::string> &headers, const std::string &body,
+                    const std::string &content_type, int timeout_seconds) {
+	auto transport = in_transport ? nullptr : CurrentTransport();
+	if (!transport || !*transport) {
+		return BuiltInSend(method, url, headers, body, content_type, timeout_seconds);
+	}
+	// the same URL rules whoever carries the request: http(s) only, a well-formed authority
+	auto parts = ParseUrl(url);
+	if (!parts.error.empty()) {
+		HttpResult refused;
+		refused.error = parts.error;
+		return refused;
+	}
+	struct Entered {
+		Entered() {
+			in_transport = true;
+		}
+		~Entered() {
+			in_transport = false;
+		}
+	} entered;
+	auto out = (*transport)(method, url, headers, body, content_type, timeout_seconds);
+	HideRequest(out.error, headers, body, content_type);
+	return out;
+}
+
+HttpResult HttpGet(const std::string &url, int timeout_seconds) {
+	return HttpSend("GET", url, {}, "", "", timeout_seconds);
+}
+
+HttpResult HttpPostForm(const std::string &url, const std::map<std::string, std::string> &params, int timeout_seconds) {
+	return HttpSend("POST", url, {}, FormEncode(params), "application/x-www-form-urlencoded", timeout_seconds);
 }
 
 Endpoints Discover(const std::string &issuer_url, int timeout_seconds) {
