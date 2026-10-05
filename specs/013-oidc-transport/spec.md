@@ -42,9 +42,22 @@ class TransportScope { explicit TransportScope(Transport); ~TransportScope(); };
 - **The transport gets what the built-in client would send**: the URL, the headers (an `Authorization`
   included) and the body (a client secret or an assertion included). It belongs to the consumer, in the
   consumer's process.
-- **The module's guarantees still hold**: the issuer check, the redaction of presented credentials in
-  errors and the refusal of `http` for non-loopback hosts. They are made on the answer, whoever carried
-  it.
+- **What the module checks on any transport's answer**: the discovery document's issuer, and no
+  cleartext endpoint named by an https issuer (the downgrade check). The URL is checked before it is
+  handed over (`http`/`https` only).
+- **What moves to the transport**: TLS certificate verification, and the built-in client's refusal of
+  https in a build without TLS. Whether a cleartext issuer is acceptable at all stays the consumer's rule
+  (tresor allows `http` for loopback only), as before.
+- **The transport's contract** (`oidc_core.hpp`): it follows no redirect (a followed 307 would re-send a
+  secret), logs no header or body, and reports a failure as `error` with status 0.
+- **Errors never carry what was sent**: after a consumer's transport, the module redacts from its error
+  the `Authorization` header's value, each form value (encoded and decoded) and a body, so a grant's
+  error (refresh, client credentials, device, code exchange) cannot quote a credential.
+- **Re-entry**: a transport that calls the module (a grant inside a request) reaches the built-in
+  client, not itself.
+- **Lifetime**: the default is process-wide for the consumer's namespace, the last one set wins; clearing
+  it does not wait for a request in flight, so a transport keeps what it captures alive. A scope is a
+  local variable, LIFO; an empty scope is the built-in client whatever the default.
 
 ## Testing
 
@@ -55,3 +68,8 @@ without TLS:
 - an empty inner scope as the built-in client, and the outer scope restored after it;
 - another thread unaffected;
 - the default transport, and an empty default as the built-in client.
+- a scope over a default, and an empty scope with a default set (the built-in client);
+- the headers and the timeout passed through as given;
+- a transport error that echoes the request: no refresh token, client secret, bearer token or body in it;
+- a non-http(s) URL refused before the transport; a transport's discovery answer still issuer-checked;
+- a transport calling back into the module reaches the built-in client once.

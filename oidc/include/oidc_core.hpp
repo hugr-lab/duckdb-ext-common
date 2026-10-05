@@ -44,9 +44,9 @@ struct HttpResult {
 	}
 };
 
-//! GET / form-POST against an http(s) URL. https needs a TLS-enabled build
-//! (DUCKDB_EXT_COMMON_OIDC_TLS, where the consumer links OpenSSL); without one it
-//! returns a transport error that says so rather than silently downgrading.
+//! GET / form-POST against an http(s) URL. With the built-in client, https needs a TLS-enabled build
+//! (DUCKDB_EXT_COMMON_OIDC_TLS, where the consumer links OpenSSL); without one it returns a transport
+//! error that says so rather than silently downgrading. A consumer's transport carries its own TLS.
 HttpResult HttpGet(const std::string &url, int timeout_seconds = 10);
 HttpResult HttpPostForm(const std::string &url, const std::map<std::string, std::string> &params,
                         int timeout_seconds = 30);
@@ -58,15 +58,26 @@ HttpResult HttpSend(const std::string &method, const std::string &url,
 
 //! A transport that carries this module's requests instead of its own httplib client (spec 013): the
 //! consumer's, such as DuckDB's HTTPUtil - in a wasm build, the browser's fetch through httpfs. It gets each
-//! request as HttpSend does, a GET and a form POST included.
+//! request as HttpSend does, a GET and a form POST included. Its contract, as the built-in client keeps it:
+//! - it verifies the server's TLS certificate for https;
+//! - it follows **no redirect**: a 3xx is returned as the answer (a followed 307 would re-send a secret, a
+//!   refresh token or a code verifier to wherever it points);
+//! - it logs no request header or body (an Authorization header, a form's secret);
+//! - an HTTP answer is `status` + `body` with an empty `error`; a failure is `error` with status 0, and the
+//!   error names no header or body content (the module redacts what it sent, anyway);
+//! - it keeps alive whatever it captures for as long as it may be called: clearing a default does not wait
+//!   for a request already running on another thread.
+//! A transport that calls back into this module (HttpSend, a grant) reaches the built-in client, not itself.
 using Transport = std::function<HttpResult(const std::string &method, const std::string &url,
-                                           const std::map<std::string, std::string> &headers,
-                                           const std::string &body, const std::string &content_type,
-                                           int timeout_seconds)>;
-//! The process's transport where no scope sets one; empty (the default) is the built-in client.
+                                           const std::map<std::string, std::string> &headers, const std::string &body,
+                                           const std::string &content_type, int timeout_seconds)>;
+//! The process's transport where no scope sets one; empty (the default) is the built-in client. It is this
+//! consumer's alone (each compiles its own copy of the module); the last one set wins.
 void SetDefaultTransport(Transport transport);
 //! The calling thread's transport while this lives: every request made on the thread, the module's own
-//! included (a token refresh inside a consumer's call). Scopes nest; the previous one is restored.
+//! included (a token refresh inside a consumer's call). Scopes nest; the previous one is restored. A local
+//! variable only - never on the heap, never ended out of order. An empty transport is the built-in client,
+//! whatever the default.
 class TransportScope {
 public:
 	explicit TransportScope(Transport transport);
