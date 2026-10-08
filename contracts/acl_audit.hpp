@@ -27,7 +27,8 @@
 // says so in a gauge, the extension refuses to attach and says so in its
 // status - never dereferenced. Bump the version on ANY change to what this
 // header lays out: AuditEvent, AuditObject, AuditLevel, Principal, the
-// interfaces, AuditCounters, AuditGauges, AuditHooks.
+// lineage payload (AuditLineage and its parts), the interfaces, AuditCounters,
+// AuditGauges, AuditHooks.
 //
 // Delivery is decoupled from the decision: the emitting seam composes the
 // event and pushes it onto one bounded queue; the audit thread pops and hands
@@ -164,6 +165,99 @@ struct AuditPlanNode {
 	bool dynamic_filters = false;
 };
 
+//===----------------------------------------------------------------------===//
+// spec 014 (duckdb-acl spec 107): lineage - what a node defines and what it writes, as the facts an
+// OpenLineage transport turns into RunEvents and DatasetEvents. The shapes follow OpenLineage's
+// facets (schema, symlinks, tags, columnLineage, lifecycleStateChange) so a transport maps them one
+// to one; the producer fills them, a sink only renders. Unlike every other kind, a lineage payload
+// may name physical datasets (the producer's operator can turn that off), and may carry a
+// NORMALIZED statement text - every constant replaced - when the operator turns the SQL facet on
+// (charter R7, amended by spec 014). Never a value, a parameter, a claim, a token or a handle.
+//===----------------------------------------------------------------------===//
+
+//! A field of a dataset's schema; a STRUCT's or a LIST's children nest (`_element` for a list).
+struct AuditLineageField {
+	string name;
+	string type;
+	vector<AuditLineageField> fields;
+};
+
+//! OpenLineage SymlinksDatasetFacet identifier: another name the same dataset is known by.
+struct AuditLineageSymlink {
+	string ns; // namespace
+	string name;
+	string type; // TABLE / VIEW / ...
+};
+
+//! OpenLineage TagsDatasetFacet entry; `field` empty = the whole dataset. duckdb-acl: per-role
+//! visibility, `acl.role.<role>` = visible / masked / a capability list.
+struct AuditLineageTag {
+	string key;
+	string value;
+	string field; // a field path (`address.city`, `items[].price`), or empty
+};
+
+//! A dataset an event reads or writes, or (a static event) the one it defines.
+struct AuditLineageDataset {
+	string ns;             // namespace (`acl://<ns>/<vcat>`, `acl://<ns>/source/<alias>`, `file://...`)
+	string name;           // `<schema>.<object>`
+	string dataset_type;   // OpenLineage DatasetTypeDatasetFacet: TABLE / VIEW / FUNCTION / FILE / ...
+	bool physical = false; // a physical dataset - a transport honours the producer's switch
+	string lifecycle;      // CREATE / ALTER / DROP / OVERWRITE / TRUNCATE, or empty
+	vector<AuditLineageField> schema;
+	vector<AuditLineageSymlink> symlinks;
+	vector<AuditLineageTag> tags;
+};
+
+//! One edge: target field <- source field, with OpenLineage's transformation. Datasets are indices
+//! into AuditLineage::datasets. An empty `target_field` is an edge to the whole target (an INDIRECT
+//! filter / join / group key); an empty `source_field`, a source taken whole (an opaque function).
+struct AuditLineageEdge {
+	int32_t target = -1;
+	string target_field;
+	int32_t source = -1;
+	string source_field;
+	string type;    // DIRECT / INDIRECT
+	string subtype; // IDENTITY / TRANSFORMATION / AGGREGATION / JOIN / GROUP_BY / FILTER / SORT / WINDOW / CONDITIONAL
+	bool masking = false;
+};
+
+//! OpenLineage ParentRunFacet / root parent: the external job a statement declared itself a step of.
+struct AuditLineageRunRef {
+	string ns;
+	string job;
+	string run_id;
+	bool Empty() const {
+		return run_id.empty();
+	}
+};
+
+//! The facts of one lineage event (AuditEvent::lineage, kind `lineage`).
+struct AuditLineage {
+	string event_type; // RUN_COMPLETE / RUN_FAIL (a write or a declared read) / DATASET (a definition)
+	string run_id;     // a UUID the producer mints; empty for DATASET
+	string job_ns;
+	string job_name;
+	AuditLineageRunRef parent;
+	AuditLineageRunRef root_parent;
+	vector<AuditLineageDataset> datasets;
+	vector<int32_t> inputs;  // indices into datasets
+	vector<int32_t> outputs; // indices into datasets
+	vector<AuditLineageEdge> edges;
+	string sql;     // normalized (every constant a `?`), only when the producer's operator turned it on
+	string dialect; // `duckdb` when sql is set
+	//! The producer's identity facet (`acl`): who, at the level its operator chose - empty fields
+	//! are not reported. Never a claim value, a token or a handle.
+	string client;
+	string issuer;
+	vector<string> roles;
+	string subject;
+	string node_group;
+	bool approximate = false; // some edges could not be derived exactly (a remote subtree, an opaque function)
+	bool truncated = false;   // edges were cut at the producer's limit
+	int64_t dropped = -1;     // a `dropped` notice: how many lineage events the producer's queue shed
+};
+
 //! One decision, or one lifecycle occurrence. Never the statement text, parameters, rows or
 //! physical names; claim values are here in memory (`principal.claims`) for a sink to filter, and
 //! never written by a base sink.
@@ -175,7 +269,7 @@ struct AuditEvent {
 	string door;                              // flight / quack / gateway / admin / session
 	string session;                           // the ops id, never the handle; empty off a session
 	Principal principal;
-	string kind;      // statement / admin / session / ingest / door / policy / keys / profile
+	string kind;      // statement / admin / session / ingest / door / policy / keys / profile / lineage
 	string statement; // the statement class, or MANAGEMENT / NATIVE; empty for lifecycle kinds
 	vector<AuditObject> objects;
 	bool allowed = true;
@@ -205,6 +299,9 @@ struct AuditEvent {
 	bool truncated = false;        // `plan` was cut at its limit; `sources` is rolled up over the whole tree
 	vector<AuditSource> sources;
 	vector<AuditPlanNode> plan;
+	//! spec 014, kind `lineage`: the facts; null for every other kind. Delivered only to the sinks
+	//! that ask for it (AuditSink::WantsLineage) - never to a base's file or ring of decisions.
+	shared_ptr<const AuditLineage> lineage;
 	//! False when the effective level did not record this event: it is then counted (metrics are a
 	//! state of the node, whatever the level) and never handed to a sink, the ring or the file - so a
 	//! sink only ever sees `true`.
@@ -215,6 +312,10 @@ struct AuditEvent {
 struct AuditSink {
 	virtual ~AuditSink() = default;
 	virtual void OnEvent(const AuditEvent &event) = 0;
+	//! spec 014: a sink that renders lineage says so; the others never see a `lineage` event.
+	virtual bool WantsLineage() const {
+		return false;
+	}
 	//! Called when the level or a setting changes, and at shutdown.
 	virtual void Flush() {
 	}
@@ -392,7 +493,7 @@ public:
 	//! says "stamped at all" (a registry created by a build from before the stamp has other bytes
 	//! here), then the version.
 	static constexpr int32_t CONTRACT_MAGIC = 0x41434C41; // "ACLA"
-	static constexpr int32_t CONTRACT_VERSION = 2;        // 2: spec 074 - the profile event, ProfileFor
+	static constexpr int32_t CONTRACT_VERSION = 3; // 2: spec 074 - the profile event, ProfileFor; 3: spec 014 - lineage
 	int32_t contract_magic = CONTRACT_MAGIC;
 	int32_t contract_version = CONTRACT_VERSION;
 

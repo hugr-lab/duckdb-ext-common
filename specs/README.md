@@ -31,3 +31,4 @@ Research and thinking-out-loud live in the local, gitignored `design/` folder.
 | [011](011-oidc-revocation-scope/spec.md) | the OIDC core revokes (RFC 7009), and refreshes for another scope | implemented |
 | [012](012-oidc-service-identities/spec.md) | the OIDC core for services without a shared secret — private_key_jwt, federated assertions, Azure managed identity, an audience parameter | implemented |
 | [013](013-oidc-transport/spec.md) | a consumer's HTTP transport for the OIDC core (tresor in DuckDB-wasm) | implemented |
+| [014](014-acl-audit-lineage/spec.md) | `acl_audit` v3 - the lineage kind (duckdb-acl spec 107); charter R7 amended | implemented |

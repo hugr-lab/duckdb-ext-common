@@ -80,6 +80,10 @@ parallel stay inside the directories they own.
 (session handles, delegation grant ids), statement text or parameters. Metric attributes come only
 from bounded sets — never per subject, object or secret name (those belong in events).
 
+*Amended 2026-10-08 (spec 014).* The one exception: an `acl_audit` `lineage` payload may carry a
+**normalized** statement text - before any rewrite, every constant replaced by `?` - and only when
+the producer's operator turns it on. Never a parameter value or a literal.
+
 **R8. Delivery never blocks the decision.** A producer composes an event and pushes it onto a
 bounded queue; a consumer is called on a delivery thread. A slow or failing consumer costs a counted
 drop, never latency on a statement or a lookup.
