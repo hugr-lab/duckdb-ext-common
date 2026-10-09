@@ -11,5 +11,6 @@ Contents (charter, "Initial contents"):
 | `acl_audit.hpp` + `acl_principal.hpp` | duckdb-acl | acl-otel | **spec 002** — moved as is, magic `ACLA`, version 2, no bump; `Principal` is part of the layout |
 | `tresor_audit.hpp` | tresor | acl-otel | **spec 008** - magic `TRSA`, version 1, on `hooks/ext_hooks.hpp`: `TresorAuditEvent` (logins, secret lookups, refreshes, management, an acl session's delegation grant; with the statement's trace context) and `TresorAuditHooks` |
 | `acl_connection.hpp` | duckdb-acl | tresor | **spec 005** - magic `ACLC`, version 2 (spec 007: the publisher mark): `AclConnection` (the session of the running statement, per connection) and `AclSessionHooks` (session open/close observers) |
+| `acl_lineage_sources.hpp` | duckdb-acl (asks) | hugr_node (answers) | **spec 015** - magic `ACLS`, version 1: `AclLineageSources`, the registry of `LineageSourceProvider`s that name a source's datasets in lineage (a real address, a federated platform's namespace) |
 
 Namespace: `duckdb::<producer>` (`duckdb::acl`, `duckdb::tresor`).
