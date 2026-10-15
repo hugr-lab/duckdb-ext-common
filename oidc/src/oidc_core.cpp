@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <random>
 #include <thread>
 
@@ -29,6 +30,7 @@
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/ecdsa.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -150,6 +152,64 @@ std::string FormEncode(const std::map<std::string, std::string> &params) {
 	return body;
 }
 
+// the CA bundle in force (spec 016): the calling thread's scope, else the process's default; empty = none
+std::mutex default_ca_bundle_lock;
+std::string default_ca_bundle;
+thread_local std::shared_ptr<const std::string> scoped_ca_bundle;
+
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+std::string CurrentCaBundle() {
+	if (scoped_ca_bundle) {
+		return *scoped_ca_bundle;
+	}
+	std::lock_guard<std::mutex> guard(default_ca_bundle_lock);
+	return default_ca_bundle;
+}
+
+//! The bundle's PEM, every block a certificate OpenSSL parses; empty with `error` set otherwise. The error
+//! names the file, never its content.
+std::string ReadCaBundle(const std::string &path, std::string &error) {
+	static constexpr std::streamoff MAX_BUNDLE = 16 * 1024 * 1024;
+	std::ifstream file(path, std::ios::binary);
+	if (!file) {
+		error = "the CA bundle " + path + " cannot be read";
+		return "";
+	}
+	file.seekg(0, std::ios::end);
+	auto size = std::streamoff(file.tellg());
+	if (size < 0 || size > MAX_BUNDLE) {
+		error = "the CA bundle " + path + " cannot be read (not a regular file, or larger than 16 MiB)";
+		return "";
+	}
+	std::string pem(static_cast<size_t>(size), '\0');
+	file.seekg(0, std::ios::beg);
+	if (size > 0 && !file.read(&pem[0], size)) {
+		error = "the CA bundle " + path + " cannot be read";
+		return "";
+	}
+	ERR_clear_error();
+	std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new_mem_buf(pem.data(), int(pem.size())), BIO_free);
+	size_t certificates = 0;
+	while (bio) {
+		std::unique_ptr<X509, decltype(&X509_free)> cert(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr),
+		                                                 X509_free);
+		if (!cert) {
+			break;
+		}
+		certificates++;
+	}
+	// the end of the input reads as "no start line"; anything else is a block that does not parse
+	auto last = ERR_peek_last_error();
+	auto clean_end = last == 0 || (ERR_GET_LIB(last) == ERR_LIB_PEM && ERR_GET_REASON(last) == PEM_R_NO_START_LINE);
+	ERR_clear_error();
+	if (!bio || !clean_end || certificates == 0) {
+		error = "the CA bundle " + path + " holds no PEM certificate, or one that does not parse";
+		return "";
+	}
+	return pem;
+}
+#endif
+
 template <class REQUEST>
 HttpResult Run(const UrlParts &url, int timeout_seconds, REQUEST &&request) {
 	HttpResult out;
@@ -163,6 +223,17 @@ HttpResult Run(const UrlParts &url, int timeout_seconds, REQUEST &&request) {
 		client.set_connection_timeout(timeout_seconds);
 		client.set_read_timeout(timeout_seconds);
 		client.enable_server_certificate_verification(true);
+		auto bundle = CurrentCaBundle();
+		if (!bundle.empty()) {
+			auto pem = ReadCaBundle(bundle, out.error);
+			if (pem.empty()) {
+				return out;
+			}
+			// added to this client's own store (its SSL_CTX, freed with it), and the system's roots loaded
+			// beside it: httplib's custom-CA default would otherwise leave them out
+			client.load_ca_cert_store(pem.data(), pem.size());
+			client.enable_system_ca(true);
+		}
 		auto res = request(client);
 		if (!res) {
 			out.error = "https request failed: " + hl::to_string(res.error());
@@ -527,6 +598,20 @@ TransportScope::TransportScope(Transport transport) : previous(scoped_transport)
 
 TransportScope::~TransportScope() {
 	scoped_transport = std::move(previous);
+}
+
+void SetDefaultCaBundle(std::string path) {
+	std::lock_guard<std::mutex> guard(default_ca_bundle_lock);
+	default_ca_bundle = std::move(path);
+}
+
+CaBundleScope::CaBundleScope(std::string path) : previous(scoped_ca_bundle) {
+	// an empty one is kept as such: the system roots alone for this scope, whatever the default
+	scoped_ca_bundle = std::make_shared<const std::string>(std::move(path));
+}
+
+CaBundleScope::~CaBundleScope() {
+	scoped_ca_bundle = std::move(previous);
 }
 
 HttpResult HttpSend(const std::string &method, const std::string &url,

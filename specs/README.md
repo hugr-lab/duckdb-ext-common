@@ -33,3 +33,4 @@ Research and thinking-out-loud live in the local, gitignored `design/` folder.
 | [013](013-oidc-transport/spec.md) | a consumer's HTTP transport for the OIDC core (tresor in DuckDB-wasm) | implemented |
 | [014](014-acl-audit-lineage/spec.md) | `acl_audit` v3 - the lineage kind (duckdb-acl spec 107); charter R7 amended | implemented |
 | [015](015-acl-lineage-sources/spec.md) | `acl_lineage_sources` - who names a source in lineage (`ACLS` 1; duckdb-acl spec 112) | implemented |
+| [016](016-oidc-ca-bundle/spec.md) | a CA bundle for the OIDC core's built-in client, beside the system's roots (tresor spec 030) | implemented |

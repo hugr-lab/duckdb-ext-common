@@ -89,6 +89,27 @@ private:
 	std::shared_ptr<Transport> previous;
 };
 
+//! A CA bundle the built-in client trusts for https IN ADDITION to the system's roots (spec 016): a PEM file
+//! of one or more certificates - a private CA's, say, beside a public IdP's. Verification stays on; the
+//! bundle never replaces the system roots. The file is read on each https request; one that cannot be read
+//! or holds no certificate fails the request (no fallback to the system roots alone). A consumer's transport
+//! carries its own TLS and ignores it; a build without TLS refuses https whatever is set.
+//! The process's bundle where no scope sets one; empty (the default) is the system roots alone.
+void SetDefaultCaBundle(std::string path);
+//! The calling thread's bundle while this lives, the module's own requests inside the call included. Scopes
+//! nest, the previous one is restored; a local variable only, ended in order. An empty path is the system
+//! roots alone, whatever the default.
+class CaBundleScope {
+public:
+	explicit CaBundleScope(std::string path);
+	~CaBundleScope();
+	CaBundleScope(const CaBundleScope &) = delete;
+	CaBundleScope &operator=(const CaBundleScope &) = delete;
+
+private:
+	std::shared_ptr<const std::string> previous;
+};
+
 //! The issuer's endpoints, discovered or assembled by the caller.
 struct Endpoints {
 	std::string issuer;
