@@ -22,6 +22,10 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <random>
 #include <thread>
 
@@ -29,6 +33,7 @@
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/ecdsa.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
@@ -150,6 +155,93 @@ std::string FormEncode(const std::map<std::string, std::string> &params) {
 	return body;
 }
 
+// the CA bundle in force (spec 016): the calling thread's scope, else the process's default; empty = none
+std::mutex default_ca_bundle_lock;
+std::string default_ca_bundle;
+thread_local std::shared_ptr<const std::string> scoped_ca_bundle;
+
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+std::string CurrentCaBundle() {
+	if (scoped_ca_bundle) {
+		return *scoped_ca_bundle;
+	}
+	std::lock_guard<std::mutex> guard(default_ca_bundle_lock);
+	return default_ca_bundle;
+}
+
+//! A regular file's bytes, at most `limit` of them; false when it is not one, is larger or cannot be read. A FIFO
+//! or a device is refused before it is opened (opening one could block). The path is UTF-8, as DuckDB's settings.
+bool ReadRegularFile(const std::string &path, size_t limit, std::string &content) {
+#ifdef _WIN32
+	auto wide_size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, nullptr, 0);
+	if (wide_size <= 0) {
+		return false;
+	}
+	std::wstring wide(size_t(wide_size), L'\0');
+	MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, &wide[0], wide_size);
+	struct _stat64 info;
+	if (_wstat64(wide.c_str(), &info) != 0 || (info.st_mode & _S_IFMT) != _S_IFREG) {
+		return false;
+	}
+	std::unique_ptr<FILE, decltype(&fclose)> file(_wfopen(wide.c_str(), L"rb"), fclose);
+#else
+	struct stat info;
+	if (stat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode)) {
+		return false;
+	}
+	std::unique_ptr<FILE, decltype(&fclose)> file(fopen(path.c_str(), "rb"), fclose);
+#endif
+	if (!file || info.st_size < 0 || uint64_t(info.st_size) > limit) {
+		return false;
+	}
+	content.assign(size_t(info.st_size), '\0');
+	size_t read = content.empty() ? 0 : fread(&content[0], 1, content.size(), file.get());
+	return read == content.size() && fgetc(file.get()) == EOF; // all of it: a file that grew meanwhile is refused
+}
+
+//! The bundle as PEM certificates, each one OpenSSL parsed - re-encoded, so that a TRUSTED CERTIFICATE block counts
+//! as OpenSSL's own file loader counts it (its trust settings are not kept: an anchor is an anchor). Other blocks (a
+//! CRL, a key) are ignored; a block that does not parse, or no certificate at all, is an error. Empty with `error`
+//! set then; the error names the file, never its content.
+std::string ReadCaBundle(const std::string &path, std::string &error) {
+	static constexpr size_t MAX_BUNDLE = 16 * 1024 * 1024;
+	std::string raw;
+	if (!ReadRegularFile(path, MAX_BUNDLE, raw)) {
+		error = "the CA bundle " + path + " cannot be read (a regular file of at most 16 MiB)";
+		return "";
+	}
+	ERR_clear_error();
+	std::unique_ptr<BIO, decltype(&BIO_free)> in(BIO_new_mem_buf(raw.data(), int(raw.size())), BIO_free);
+	std::unique_ptr<BIO, decltype(&BIO_free)> out(BIO_new(BIO_s_mem()), BIO_free);
+	// never a passphrase prompt for an encrypted key someone left in the file
+	auto no_passphrase = [](char *, int, int, void *) {
+		return 0;
+	};
+	STACK_OF(X509_INFO) *infos = in ? PEM_X509_INFO_read_bio(in.get(), nullptr, no_passphrase, nullptr) : nullptr;
+	size_t certificates = 0;
+	bool written = true;
+	if (infos) {
+		for (int i = 0; i < sk_X509_INFO_num(infos); i++) {
+			auto info = sk_X509_INFO_value(infos, i);
+			if (info && info->x509) {
+				written = written && out && PEM_write_bio_X509(out.get(), info->x509) == 1;
+				certificates++;
+			}
+		}
+		sk_X509_INFO_pop_free(infos, X509_INFO_free);
+	}
+	ERR_clear_error();
+	std::fill(raw.begin(), raw.end(), '\0'); // a key someone left in the file need not linger
+	if (!infos || certificates == 0 || !written) {
+		error = "the CA bundle " + path + " holds no PEM certificate, or one that does not parse";
+		return "";
+	}
+	char *data = nullptr;
+	auto size = BIO_get_mem_data(out.get(), &data);
+	return std::string(data, size_t(size));
+}
+#endif
+
 template <class REQUEST>
 HttpResult Run(const UrlParts &url, int timeout_seconds, REQUEST &&request) {
 	HttpResult out;
@@ -163,6 +255,18 @@ HttpResult Run(const UrlParts &url, int timeout_seconds, REQUEST &&request) {
 		client.set_connection_timeout(timeout_seconds);
 		client.set_read_timeout(timeout_seconds);
 		client.enable_server_certificate_verification(true);
+		auto bundle = CurrentCaBundle();
+		if (!bundle.empty()) {
+			auto pem = ReadCaBundle(bundle, out.error);
+			if (pem.empty()) {
+				return out;
+			}
+			// added to this client's own store (its SSL_CTX, freed with it), and the system's roots loaded
+			// beside it: httplib's custom-CA default would otherwise leave them out. A certificate the store
+			// would not take is one anchor fewer - never more trust.
+			client.load_ca_cert_store(pem.data(), pem.size());
+			client.enable_system_ca(true);
+		}
 		auto res = request(client);
 		if (!res) {
 			out.error = "https request failed: " + hl::to_string(res.error());
@@ -527,6 +631,20 @@ TransportScope::TransportScope(Transport transport) : previous(scoped_transport)
 
 TransportScope::~TransportScope() {
 	scoped_transport = std::move(previous);
+}
+
+void SetDefaultCaBundle(std::string path) {
+	std::lock_guard<std::mutex> guard(default_ca_bundle_lock);
+	default_ca_bundle = std::move(path);
+}
+
+CaBundleScope::CaBundleScope(std::string path) : previous(scoped_ca_bundle) {
+	// an empty one is kept as such: the system roots alone for this scope, whatever the default
+	scoped_ca_bundle = std::make_shared<const std::string>(std::move(path));
+}
+
+CaBundleScope::~CaBundleScope() {
+	scoped_ca_bundle = std::move(previous);
 }
 
 HttpResult HttpSend(const std::string &method, const std::string &url,

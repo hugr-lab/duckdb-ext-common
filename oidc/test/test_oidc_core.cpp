@@ -8,7 +8,15 @@
 
 #include "oidc_core.hpp"
 
+// the TLS build serves https too (spec 016: a server behind a private CA): the bundled httplib with OpenSSL lives
+// in its own namespace, aliased to the one the rest of the test names
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
 #include "httplib.hpp"
+#ifdef DUCKDB_EXT_COMMON_OIDC_TLS
+namespace duckdb_httplib = duckdb_httplib_openssl;
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -22,6 +30,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 #include <cstdlib>
@@ -36,6 +45,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #endif
 
 using namespace duckdb::DUCKDB_EXT_COMMON_OIDC_NAMESPACE::oidc;
@@ -204,6 +214,108 @@ bool VerifyJwt(const std::string &jwt, const std::string &public_pem, std::strin
 	       EVP_DigestVerify(ctx.get(), reinterpret_cast<const unsigned char *>(signature.data()), signature.size(),
 	                        reinterpret_cast<const unsigned char *>(input.data()), input.size()) == 1;
 }
+
+//===--- spec 016: a private CA, and an https server whose certificate it signed ---===//
+
+using KeyPtr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+using CertPtr = std::unique_ptr<X509, decltype(&X509_free)>;
+
+void AddExtension(X509 *cert, X509 *issuer, int nid, const char *value) {
+	X509V3_CTX ctx;
+	X509V3_set_ctx_nodb(&ctx);
+	X509V3_set_ctx(&ctx, issuer, cert, nullptr, nullptr, 0);
+	auto ext = X509V3_EXT_conf_nid(nullptr, &ctx, nid, value);
+	X509_add_ext(cert, ext, -1);
+	X509_EXTENSION_free(ext);
+}
+
+//! A CA certificate (issuer null: self-signed, names null) or a server's, signed by `issuer_key`, for `names`.
+CertPtr Issue(EVP_PKEY *key, const char *cn, X509 *issuer, EVP_PKEY *issuer_key, const char *names) {
+	static long serial = 100;
+	CertPtr cert(X509_new(), X509_free);
+	X509_set_version(cert.get(), 2);
+	ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), serial++);
+	X509_gmtime_adj(X509_getm_notBefore(cert.get()), -60);
+	X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3600);
+	X509_set_pubkey(cert.get(), key);
+	auto name = X509_get_subject_name(cert.get());
+	X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>(cn), -1, -1, 0);
+	X509_set_issuer_name(cert.get(), issuer ? X509_get_subject_name(issuer) : name);
+	auto signer = issuer ? issuer : cert.get();
+	if (!names) {
+		AddExtension(cert.get(), signer, NID_basic_constraints, "critical,CA:TRUE");
+		AddExtension(cert.get(), signer, NID_key_usage, "critical,keyCertSign,cRLSign");
+		AddExtension(cert.get(), signer, NID_subject_key_identifier, "hash");
+	} else {
+		AddExtension(cert.get(), signer, NID_basic_constraints, "CA:FALSE");
+		AddExtension(cert.get(), signer, NID_ext_key_usage, "serverAuth");
+		AddExtension(cert.get(), signer, NID_subject_alt_name, names);
+	}
+	X509_sign(cert.get(), issuer_key ? issuer_key : key, EVP_sha256());
+	return cert;
+}
+
+std::string CertPem(X509 *cert) {
+	std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new(BIO_s_mem()), BIO_free);
+	PEM_write_bio_X509(bio.get(), cert);
+	char *data = nullptr;
+	auto size = BIO_get_mem_data(bio.get(), &data);
+	return std::string(data, size_t(size));
+}
+
+void WriteFile(const std::string &path, const std::string &content) {
+	auto file = fopen(path.c_str(), "wb");
+	fwrite(content.data(), 1, content.size(), file);
+	fclose(file);
+}
+
+//! A private CA: its key, its certificate, its PEM file in `dir`.
+struct PrivateCa {
+	KeyPtr key {EVP_EC_gen("P-256"), EVP_PKEY_free};
+	CertPtr cert {nullptr, X509_free};
+	std::string pem_path;
+
+	PrivateCa(const std::string &dir, const char *cn) {
+		cert = Issue(key.get(), cn, nullptr, nullptr, nullptr);
+		pem_path = dir + "/" + cn + ".pem";
+		WriteFile(pem_path, CertPem(cert.get()));
+	}
+};
+
+//! An https server on loopback whose certificate `ca` signed for `names`; GET /hello answers "hello".
+struct TlsServer {
+	std::string cert_path, key_path;
+	std::unique_ptr<duckdb_httplib::SSLServer> server;
+	std::thread thread;
+	int port = 0;
+	std::atomic<int> hits {0};
+
+	TlsServer(const std::string &dir, const char *cn, PrivateCa &ca, const char *names) {
+		KeyPtr key(EVP_EC_gen("P-256"), EVP_PKEY_free);
+		auto cert = Issue(key.get(), cn, ca.cert.get(), ca.key.get(), names);
+		cert_path = dir + "/" + cn + ".crt";
+		key_path = dir + "/" + cn + ".key";
+		WriteFile(cert_path, CertPem(cert.get()));
+		WriteFile(key_path, Pem(key.get(), true));
+		server.reset(new duckdb_httplib::SSLServer(cert_path.c_str(), key_path.c_str()));
+		server->Get("/hello", [this](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
+			hits++;
+			res.set_content("hello", "text/plain");
+		});
+		port = server->bind_to_any_port("127.0.0.1");
+		thread = std::thread([this] { server->listen_after_bind(); });
+		server->wait_until_ready();
+	}
+	~TlsServer() {
+		server->stop();
+		if (thread.joinable()) {
+			thread.join();
+		}
+	}
+	std::string Url() const {
+		return "https://127.0.0.1:" + std::to_string(port) + "/hello";
+	}
+};
 #endif
 
 int failures = 0;
@@ -1297,6 +1409,142 @@ int main() {
 		Check(!obo_refused.Ok() && obo_refused.error_code == "invalid_grant" &&
 		          obo_refused.error.find("stale") == std::string::npos,
 		      "On-Behalf-Of refused, the IdP's words, not the token: " + obo_refused.error);
+	});
+
+	Scenario("a CA bundle beside the system's roots (spec 016)", [&] {
+		// a bundle is about TLS trust alone: a plain-http request does not read it, whatever it names
+		{
+			CaBundleScope scope("/nonexistent/ca.pem");
+			Check(HttpGet(idp.Issuer() + "/.well-known/openid-configuration").Ok(),
+			      "plain http does not read the bundle");
+		}
+#ifndef DUCKDB_EXT_COMMON_OIDC_TLS
+		CaBundleScope scope("/nonexistent/ca.pem");
+		auto refused = HttpGet("https://127.0.0.1:1/");
+		Check(refused.error.find("TLS-enabled build") != std::string::npos,
+		      "a plain build refuses https, bundle or not: " + refused.error);
+#else
+		char dir_template[] = "/tmp/oidc-ca-XXXXXX";
+		std::string dir = mkdtemp(dir_template);
+		PrivateCa ca(dir, "private-ca");
+		PrivateCa other(dir, "other-ca");
+		TlsServer node(dir, "node", ca, "IP:127.0.0.1,DNS:localhost");
+
+		auto none = HttpGet(node.Url());
+		Check(!none.Ok() && none.status == 0 && !none.error.empty(),
+		      "without the bundle the private CA's server does not verify: " + none.error);
+		{
+			CaBundleScope scope(ca.pem_path);
+			auto with = HttpGet(node.Url());
+			Check(with.Ok() && with.body == "hello", "with the bundle in a scope it verifies: " + with.error);
+			{
+				CaBundleScope inner("");
+				Check(!HttpGet(node.Url()).Ok(), "an empty inner scope is the system's roots alone");
+			}
+			Check(HttpGet(node.Url()).Ok(), "the outer scope is restored after it");
+			bool other_thread_ok = true;
+			std::thread([&] { other_thread_ok = HttpGet(node.Url()).Ok(); }).join();
+			Check(!other_thread_ok, "another thread does not see the scope");
+			Check(HttpSend("GET", node.Url(), {{"Accept", "text/plain"}}).Ok(), "HttpSend in the scope verifies");
+		}
+		SetDefaultCaBundle(ca.pem_path);
+		Check(HttpGet(node.Url()).Ok(), "the process's default bundle verifies");
+		{
+			CaBundleScope empty("");
+			Check(!HttpGet(node.Url()).Ok(), "an empty scope over a default is the system's roots alone");
+		}
+		{
+			CaBundleScope wrong(other.pem_path);
+			Check(!HttpGet(node.Url()).Ok(), "a scope's bundle wins over the default (another CA: refused)");
+		}
+		SetDefaultCaBundle("");
+		Check(!HttpGet(node.Url()).Ok(), "a cleared default is the system's roots alone");
+
+		// a bundle of several certificates; a trusted CA's leaf named for another host still fails
+		WriteFile(dir + "/both.pem", CertPem(other.cert.get()) + CertPem(ca.cert.get()));
+		TlsServer elsewhere(dir, "elsewhere", ca, "DNS:elsewhere.test");
+		{
+			CaBundleScope scope(dir + "/both.pem");
+			Check(HttpGet(node.Url()).Ok(), "a bundle of several certificates: each counts");
+			auto wrong_name = HttpGet(elsewhere.Url());
+			Check(!wrong_name.Ok(),
+			      "a trusted CA's certificate for another name still fails (hostname checked): " + wrong_name.error);
+		}
+		// what OpenSSL's file loader takes: a TRUSTED CERTIFICATE block, text around the blocks, another block
+		// between them (a public key: ignored), CRLF line ends
+		{
+			std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new(BIO_s_mem()), BIO_free);
+			PEM_write_bio_X509_AUX(bio.get(), ca.cert.get());
+			char *data = nullptr;
+			auto size = BIO_get_mem_data(bio.get(), &data);
+			std::string trusted(data, size_t(size));
+			KeyPtr stray(EVP_EC_gen("P-256"), EVP_PKEY_free);
+			std::string crlf;
+			for (char c : "# a bundle's comment\n" + Pem(stray.get(), false) + trusted) {
+				crlf += c == '\n' ? std::string("\r\n") : std::string(1, c);
+			}
+			WriteFile(dir + "/trusted.pem", crlf);
+			Check(trusted.find("TRUSTED CERTIFICATE") != std::string::npos, "the AUX form is a TRUSTED CERTIFICATE");
+			CaBundleScope scope(dir + "/trusted.pem");
+			auto result = HttpGet(node.Url());
+			Check(result.Ok(), "a TRUSTED CERTIFICATE block, comments, another block, CRLF: verifies " + result.error);
+		}
+
+		// a bundle that cannot be used fails the request before it is sent - no fallback
+		auto hits = node.hits.load();
+		WriteFile(dir + "/garbage.pem", "not a certificate\n");
+		KeyPtr lone_key(EVP_EC_gen("P-256"), EVP_PKEY_free);
+		WriteFile(dir + "/key-only.pem", Pem(lone_key.get(), true));
+		WriteFile(dir + "/truncated.pem", CertPem(ca.cert.get()) + "-----BEGIN CERTIFICATE-----\nAAAA\n");
+		WriteFile(dir + "/empty.pem", "");
+		// a FIFO is refused before it is opened: opening one would wait for a writer
+		mkfifo((dir + "/fifo.pem").c_str(), 0600);
+		struct Bad {
+			std::string path;
+			const char *says;
+		};
+		for (auto &bad : std::vector<Bad> {{"/nonexistent/ca.pem", "cannot be read"},
+		                                   {dir, "cannot be read"},
+		                                   {dir + "/fifo.pem", "cannot be read"},
+		                                   {dir + "/garbage.pem", "holds no PEM certificate"},
+		                                   {dir + "/key-only.pem", "holds no PEM certificate"},
+		                                   {dir + "/truncated.pem", "holds no PEM certificate"},
+		                                   {dir + "/empty.pem", "holds no PEM certificate"}}) {
+			CaBundleScope scope(bad.path);
+			auto result = HttpGet(node.Url());
+			Check(!result.Ok() && result.status == 0 && result.error.find(bad.says) != std::string::npos &&
+			          result.error.find(bad.path) != std::string::npos &&
+			          result.error.find("PRIVATE KEY") == std::string::npos,
+			      "an unusable bundle fails the request: " + result.error);
+		}
+		Check(node.hits.load() == hits, "none of them reached the server");
+
+#ifndef __APPLE__
+		// the system's roots still count beside a bundle. Network-free: OpenSSL's default paths read
+		// SSL_CERT_FILE, so a second private CA stands in for the system's. (On macOS the bundled httplib reads
+		// the keychain and adds the default paths only when the keychain gives nothing; there the network
+		// check below covers it.)
+		PrivateCa system_ca(dir, "system-ca");
+		setenv("SSL_CERT_FILE", system_ca.pem_path.c_str(), 1);
+		TlsServer public_node(dir, "public", system_ca, "IP:127.0.0.1");
+		Check(HttpGet(public_node.Url()).Ok(), "the stand-in system root verifies without a bundle");
+		{
+			CaBundleScope scope(ca.pem_path);
+			Check(HttpGet(public_node.Url()).Ok(), "the system's roots still count with a bundle set");
+			Check(HttpGet(node.Url()).Ok(), "and the bundle's CA beside them");
+		}
+		unsetenv("SSL_CERT_FILE");
+#endif
+		// a real public host with a bundle set, where the network is allowed (OIDC_TEST_NETWORK=1)
+		if (getenv("OIDC_TEST_NETWORK")) {
+			CaBundleScope scope(ca.pem_path);
+			auto result = HttpGet("https://www.google.com/");
+			Check(result.error.empty() && result.status > 0,
+			      "a public host still verifies with a bundle set: " + result.error);
+		}
+		auto cleanup = "rm -rf '" + dir + "'";
+		(void)system(cleanup.c_str());
+#endif
 	});
 
 	Scenario("the TLS branch is compiled in exactly when DUCKDB_EXT_COMMON_OIDC_TLS is", [&] {
