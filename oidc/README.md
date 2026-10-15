@@ -36,7 +36,9 @@ browser's `fetch`), where sockets do not exist.
 The built-in client verifies https against the system's roots, and against a consumer's CA bundle as well
 when one is set: a PEM file (one or more certificates) through a `CaBundleScope` for the calling thread or
 `SetDefaultCaBundle` for the process - a private CA's next to a public IdP's. It never replaces the
-system's roots; a bundle that cannot be read fails the request. tresor passes DuckDB's `ca_cert_file`.
+system's roots; a bundle that cannot be read fails the request. tresor passes DuckDB's `ca_cert_file`. On
+Windows a bundle turns off httplib's extra Schannel check (revocation, the Disallowed store) for every host;
+OpenSSL's verification still decides.
 
 ## Testing it
 

@@ -14,8 +14,13 @@ mkdir -p "$out"
 # its bundled re2: re2 is compiled in from the same tree and the wrapper is the test's own shim
 # (duckdb's reaches into its exception machinery), so the binary links nothing of a built duckdb
 re2="$(find "$duckdb/third_party/re2" -name '*.cc' | sort | tr '\n' ' ') oidc/test/duckdb_re2_shim.cpp"
+# a newer 2.0 tree defines hugeint_t(int64_t) constexpr in its header: the shim must not define it again
+shim=()
+if grep -q 'constexpr hugeint_t::hugeint_t(int64_t' "$duckdb/src/include/duckdb/common/hugeint.hpp"; then
+	shim=(-DDUCKDB_SHIM_HUGEINT_INLINE=1)
+fi
 "$cxx" $flags -std=c++17 -g -O1 -pthread -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
-	-DDUCKDB_EXT_COMMON_OIDC_NAMESPACE=ext_common \
+	-DDUCKDB_EXT_COMMON_OIDC_NAMESPACE=ext_common ${shim[@]+"${shim[@]}"} \
 	-I oidc/include -I "$duckdb/third_party/httplib" -I "$duckdb/third_party/yyjson/include" \
 	-I "$duckdb/src/include" -I "$duckdb/third_party/fmt/include" -I "$duckdb/third_party/re2" \
 	oidc/fuzz/fuzz_oidc_parse.cpp oidc/src/oidc_core.cpp "$duckdb/third_party/yyjson/yyjson.cpp" $re2 \

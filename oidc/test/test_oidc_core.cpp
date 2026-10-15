@@ -30,6 +30,7 @@ namespace duckdb_httplib = duckdb_httplib_openssl;
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 #include <cstdlib>
@@ -1469,6 +1470,25 @@ int main() {
 			Check(!wrong_name.Ok(),
 			      "a trusted CA's certificate for another name still fails (hostname checked): " + wrong_name.error);
 		}
+		// what OpenSSL's file loader takes: a TRUSTED CERTIFICATE block, text around the blocks, another block
+		// between them (a public key: ignored), CRLF line ends
+		{
+			std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new(BIO_s_mem()), BIO_free);
+			PEM_write_bio_X509_AUX(bio.get(), ca.cert.get());
+			char *data = nullptr;
+			auto size = BIO_get_mem_data(bio.get(), &data);
+			std::string trusted(data, size_t(size));
+			KeyPtr stray(EVP_EC_gen("P-256"), EVP_PKEY_free);
+			std::string crlf;
+			for (char c : "# a bundle's comment\n" + Pem(stray.get(), false) + trusted) {
+				crlf += c == '\n' ? std::string("\r\n") : std::string(1, c);
+			}
+			WriteFile(dir + "/trusted.pem", crlf);
+			Check(trusted.find("TRUSTED CERTIFICATE") != std::string::npos, "the AUX form is a TRUSTED CERTIFICATE");
+			CaBundleScope scope(dir + "/trusted.pem");
+			auto result = HttpGet(node.Url());
+			Check(result.Ok(), "a TRUSTED CERTIFICATE block, comments, another block, CRLF: verifies " + result.error);
+		}
 
 		// a bundle that cannot be used fails the request before it is sent - no fallback
 		auto hits = node.hits.load();
@@ -1477,12 +1497,15 @@ int main() {
 		WriteFile(dir + "/key-only.pem", Pem(lone_key.get(), true));
 		WriteFile(dir + "/truncated.pem", CertPem(ca.cert.get()) + "-----BEGIN CERTIFICATE-----\nAAAA\n");
 		WriteFile(dir + "/empty.pem", "");
+		// a FIFO is refused before it is opened: opening one would wait for a writer
+		mkfifo((dir + "/fifo.pem").c_str(), 0600);
 		struct Bad {
 			std::string path;
 			const char *says;
 		};
 		for (auto &bad : std::vector<Bad> {{"/nonexistent/ca.pem", "cannot be read"},
 		                                   {dir, "cannot be read"},
+		                                   {dir + "/fifo.pem", "cannot be read"},
 		                                   {dir + "/garbage.pem", "holds no PEM certificate"},
 		                                   {dir + "/key-only.pem", "holds no PEM certificate"},
 		                                   {dir + "/truncated.pem", "holds no PEM certificate"},
@@ -1502,8 +1525,8 @@ int main() {
 		// the keychain and adds the default paths only when the keychain gives nothing; there the network
 		// check below covers it.)
 		PrivateCa system_ca(dir, "system-ca");
-		TlsServer public_node(dir, "public", system_ca, "IP:127.0.0.1");
 		setenv("SSL_CERT_FILE", system_ca.pem_path.c_str(), 1);
+		TlsServer public_node(dir, "public", system_ca, "IP:127.0.0.1");
 		Check(HttpGet(public_node.Url()).Ok(), "the stand-in system root verifies without a bundle");
 		{
 			CaBundleScope scope(ca.pem_path);

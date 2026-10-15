@@ -31,8 +31,10 @@ InternalException::InternalException(const string &msg) : Exception(ExceptionTyp
 string Exception::ConstructMessageRecursive(const string &msg, std::vector<ExceptionFormatValue> &) {
 	return msg;
 }
+#ifndef DUCKDB_SHIM_HUGEINT_INLINE // newer 2.0 trees define it constexpr in hugeint.hpp (the scripts detect it)
 hugeint_t::hugeint_t(int64_t value) : lower(static_cast<uint64_t>(value)), upper(value < 0 ? -1 : 0) {
 }
+#endif
 ExceptionFormatValue::ExceptionFormatValue(int64_t int_val_p)
     : type(ExceptionFormatValueType::FORMAT_VALUE_TYPE_INTEGER), int_val(int_val_p) {
 }

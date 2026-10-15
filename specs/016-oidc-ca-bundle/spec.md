@@ -31,19 +31,26 @@ class CaBundleScope { explicit CaBundleScope(std::string path); ~CaBundleScope()
   an empty scope means that whatever the default (as an empty `TransportScope` means the built-in client).
   Scopes nest and restore the previous one; a local variable only, LIFO. The default is behind a mutex,
   the scope `thread_local` - another thread never sees a scope.
-- **Added, not replacing.** On each https request the client reads the file, checks that every PEM block is
-  a certificate OpenSSL parses and that there is at least one, adds them to **that client's own** store
+- **Added, not replacing.** On each https request the client reads the file (a regular file, checked before it
+  is opened - a FIFO would block; a UTF-8 path on Windows too), parses it as OpenSSL's file loader does
+  (`PEM_X509_INFO_read_bio`: CERTIFICATE and TRUSTED CERTIFICATE blocks count, any other block - a CRL, a key -
+  is ignored, text around the blocks too; a block that does not parse is an error), requires at least one
+  certificate, and adds them, re-encoded, to **that client's own** store
   (`SSLClient::load_ca_cert_store`, into its `SSL_CTX`'s `X509_STORE`, freed with the client) and turns the
   system's roots on beside them (`enable_system_ca(true)` - httplib's default leaves them out once a custom
   CA is given). Nothing is shared across requests or threads; no store outlives its client.
 - **The system's roots are httplib's**: OpenSSL's default paths on Linux; on macOS the keychain
   (`CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN`, on by default for clang on macOS - the bundle goes into the
   same store the keychain's roots are added to, so it applies there as well); on Windows the system's ROOT
-  and CA stores loaded into OpenSSL (httplib skips Schannel verification once a custom CA is set, so OpenSSL's
-  verification with both sets decides).
+  and CA stores loaded into OpenSSL.
+- **Windows, a known difference**: httplib runs its extra Schannel check (end-certificate revocation, the
+  Disallowed store) only when no custom CA is set. With a bundle, OpenSSL's verification against both sets
+  decides alone, for every host - a public IdP's included: nothing a chain or name check refuses is accepted,
+  but revocation and the Disallowed store are not consulted. Restoring Schannel for chains ending in a system
+  root (`set_server_certificate_verifier`) is a follow-up.
 - **Verification always on**: certificate and hostname verification as before; a bundle only adds anchors.
 - **A bundle that cannot be used fails the request** before anything is sent: unreadable (missing, a
-  directory, over 16 MiB), empty, holding no certificate, or holding a block that does not parse. The error
+  directory, a FIFO, over 16 MiB), empty, holding no certificate, or holding a block that does not parse. The error
   names the file (`the CA bundle <path> cannot be read` / `... holds no PEM certificate, or one that does not
   parse`) and never its content. No fallback to the system's roots alone.
 - **Read on each request**, so a rotated bundle counts at once; a bundle is a few KB.
@@ -54,7 +61,12 @@ class CaBundleScope { explicit CaBundleScope(std::string path); ~CaBundleScope()
 ## Compatibility
 
 The 2.0 line's bundled httplib (0.53.1: `load_ca_cert_store`, `enable_system_ca`). Consumers that want the
-bundle (tresor) call the new API; one that sets nothing behaves as before. Ships in the tag after v0.9.0.
+bundle (tresor) call the new API; one that sets nothing behaves as before. Ships in the tag after v0.12.0.
+
+**A drift fix rides along**: the 2.0 line's head now defines `hugeint_t(int64_t)` constexpr in `hugeint.hpp`,
+which the test's RegexMatch shim also defined (CI clones the head: every OIDC job and the fuzz job failed).
+`test_oidc.sh` and `fuzz_oidc.sh` detect the header's definition and pass `DUCKDB_SHIM_HUGEINT_INLINE`, so the
+shim builds against older trees (tresor's f702a1f) and the head alike.
 
 ## Testing
 
@@ -65,7 +77,8 @@ httplib `SSLServer` with a certificate it signed, generated in the test (OpenSSL
 - an empty inner scope, an empty scope over a default, a cleared default: the system's roots alone (fails);
   the outer scope restored; another thread unaffected; a scope's bundle wins over the default;
 - a bundle of two certificates; a trusted CA's certificate for another name still fails (hostname checked);
-- missing, a directory, garbage, a key only, a truncated second block, empty: each fails with its error,
+- a TRUSTED CERTIFICATE block with a comment and another block before it, CRLF line ends: verifies;
+- missing, a directory, a FIFO, garbage, a key only, a truncated second block, empty: each fails with its error,
   naming the file, and none reaches the server;
 - the system's roots still count beside a bundle: on Linux, network-free, through `SSL_CERT_FILE` standing in
   for the system's store (a second private CA). On macOS the keychain is the system's store and cannot be
@@ -85,3 +98,5 @@ httplib `SSLServer` with a certificate it signed, generated in the test (OpenSSL
 ## Follow-ups
 
 - A tag, and `docs/compatibility.md`'s row, after merge (the owner).
+- Windows: Schannel's revocation and Disallowed-store check for chains that end in a system root, with a bundle
+  set (above).

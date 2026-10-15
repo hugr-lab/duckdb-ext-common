@@ -29,7 +29,12 @@ if [ "${OIDC_TLS:-0}" = "1" ]; then
 	[ "$(uname)" = "Darwin" ] && tls+=(-framework CoreFoundation -framework Security)
 fi
 re2="$(find "$duckdb/third_party/re2" -name '*.cc' | sort | tr '\n' ' ') oidc/test/duckdb_re2_shim.cpp"
-"$cxx" $flags -std=c++17 -O1 -g -pthread -DDUCKDB_EXT_COMMON_OIDC_NAMESPACE=ext_common \
+# a newer 2.0 tree defines hugeint_t(int64_t) constexpr in its header: the shim must not define it again
+shim=()
+if grep -q 'constexpr hugeint_t::hugeint_t(int64_t' "$duckdb/src/include/duckdb/common/hugeint.hpp"; then
+	shim=(-DDUCKDB_SHIM_HUGEINT_INLINE=1)
+fi
+"$cxx" $flags -std=c++17 -O1 -g -pthread -DDUCKDB_EXT_COMMON_OIDC_NAMESPACE=ext_common ${shim[@]+"${shim[@]}"} \
 	-I oidc/include -I "$duckdb/third_party/httplib" -I "$duckdb/third_party/yyjson/include" \
 	-I "$duckdb/src/include" -I "$duckdb/third_party/fmt/include" -I "$duckdb/third_party/re2" \
 	oidc/test/test_oidc_core.cpp oidc/src/oidc_core.cpp "$duckdb/third_party/yyjson/yyjson.cpp" $re2 \
