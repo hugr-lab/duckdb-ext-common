@@ -35,3 +35,4 @@ Research and thinking-out-loud live in the local, gitignored `design/` folder.
 | [015](015-acl-lineage-sources/spec.md) | `acl_lineage_sources` - who names a source in lineage (`ACLS` 1; duckdb-acl spec 112) | implemented |
 | [016](016-oidc-ca-bundle/spec.md) | a CA bundle for the OIDC core's built-in client, beside the system's roots (tresor spec 030) | implemented |
 | [017](017-device-pkce/spec.md) | PKCE on the device flow, where the issuer advertises S256 (Keycloak with PKCE enforced) | implemented |
+| [018](018-oidc-no-builtin/spec.md) | the OIDC core without its built-in client under wasm: no httplib, sockets, threads or OpenSSL | implemented |
