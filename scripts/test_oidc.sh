@@ -22,8 +22,10 @@ if [ "${OIDC_NO_BUILTIN:-0}" = "1" ]; then
 	common=(-std=c++17 -O1 -g -DDUCKDB_EXT_COMMON_OIDC_NAMESPACE=ext_common -DDUCKDB_EXT_COMMON_OIDC_NO_BUILTIN=1
 		-I oidc/include -I "$duckdb/third_party/yyjson/include" -I "$duckdb/src/include")
 	"$cxx" $flags "${common[@]}" -c oidc/src/oidc_core.cpp -o "$out/oidc_core_no_builtin.o"
-	# what a page's wasm cannot resolve: sockets, a thread of its own, OpenSSL (macOS prefixes an underscore)
-	if nm -u "$out/oidc_core_no_builtin.o" | grep -E '(^|[ _])(socket|connect|getaddrinfo|bind|listen|accept|send|recv|poll|select|pthread_create|SSL_[A-Za-z_]*|EVP_[A-Za-z_]*)$'; then
+	# what a page's wasm cannot resolve: sockets, a thread of its own (pthread_create, or libstdc++'s
+	# std::thread::_M_start_thread), OpenSSL. macOS prefixes an underscore. nm's own failure fails the script.
+	undefined="$(nm -u "$out/oidc_core_no_builtin.o")"
+	if grep -E '(^|[ _])(socket|connect|getaddrinfo|getnameinfo|bind|listen|accept|send|recv|poll|select|pthread_create|SSL_[A-Za-z0-9_]*|EVP_[A-Za-z0-9_]*)$|_M_start_thread' <<<"$undefined"; then
 		echo "test_oidc: the core without its built-in client still references the symbols above" >&2
 		exit 1
 	fi

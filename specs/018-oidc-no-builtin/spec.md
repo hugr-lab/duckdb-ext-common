@@ -16,7 +16,7 @@ page's requests go through the browser anyway - the consumer's transport (spec 0
 
 - **`DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN`**: the core compiles no httplib and starts no thread of its own.
   - It is defined by `oidc_core.cpp` itself under `__EMSCRIPTEN__`, so a consumer's wasm build needs nothing; a
-    native build may define it (this module's test does).
+    native build may define it (this module's test does). Defined at all is on: `=0` is on too.
   - With `DUCKDB_EXT_COMMON_OIDC_TLS` too it is a compile error: TLS is the built-in client's.
 - **Every request goes through a transport** (`SetDefaultTransport`, `TransportScope`). Without one a request is
   refused with an error that says so (status 0), never attempted.
@@ -33,5 +33,5 @@ page's requests go through the browser anyway - the consumer's transport (spec 0
   refused without a transport, the loopback receiver not started, discovery and a refresh grant through a
   transport, refused again outside its scope.
 - CI: the OIDC job gains an ubuntu combination with `no_builtin`.
-- The consumer's side (tresor spec 042): its `wasm_eh` / `wasm_mvp` / `wasm_threads` builds, their imports checked,
-  and a LOAD in duckdb-wasm.
+- The consumer's side (tresor spec 042): its `wasm_eh` build's imports checked against DuckDB-wasm's engine and a
+  LOAD in DuckDB-wasm's shell, in CI; `wasm_mvp` and `wasm_threads` built by its distribution workflow.
