@@ -31,6 +31,13 @@ Every request goes through `HttpSend`, and through a consumer's transport when o
 `SetDefaultTransport` for the process. A wasm consumer routes them through DuckDB's `HTTPUtil` (the
 browser's `fetch`), where sockets do not exist.
 
+## Without the built-in client: wasm (spec 018)
+
+Under `__EMSCRIPTEN__` (or with `DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN` defined) the core compiles no httplib and
+starts no thread: no sockets, no OpenSSL, nothing a browser cannot resolve. Every request needs a transport
+(without one it is refused), the loopback receiver does not start, and `DUCKDB_EXT_COMMON_OIDC_TLS` must not be
+defined (a compile error) - a wasm consumer links no OpenSSL.
+
 ## A CA bundle beside the system's roots (spec 016)
 
 The built-in client verifies https against the system's roots, and against a consumer's CA bundle as well
@@ -45,6 +52,7 @@ OpenSSL's verification still decides.
 ```sh
 scripts/test_oidc.sh <duckdb source tree>       # the fake-IdP test, nothing of a built duckdb
 OIDC_TLS=1 scripts/test_oidc.sh <duckdb tree>   # the TLS variant consumers ship (system OpenSSL; OPENSSL_ROOT=...)
+OIDC_NO_BUILTIN=1 scripts/test_oidc.sh <duckdb tree>   # without the built-in client: no socket/thread/TLS symbol
 CXX=clang++ scripts/fuzz_oidc.sh <duckdb tree>  # the parsers under libFuzzer (linux)
 ```
 

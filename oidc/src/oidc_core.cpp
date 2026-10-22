@@ -6,12 +6,25 @@
 // CPPHTTPLIB_OPENSSL_SUPPORT - the header then lives in the duckdb_httplib_openssl namespace, so
 // there is no ODR overlap with a plain compilation elsewhere in the image (the single-TU
 // discipline mssql-extension uses). The namespace is the consumer's (oidc_core.hpp).
+//
+// A build without sockets has no built-in client and no loopback receiver (spec 018): httplib is not compiled at
+// all, and every request goes through the consumer's transport. Emscripten builds are such (a browser has no
+// sockets and a page no threads); DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN asks for it elsewhere (the module's test).
 //===----------------------------------------------------------------------===//
 
+#if defined(__EMSCRIPTEN__) && !defined(DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN)
+#define DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN 1
+#endif
+#if defined(DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN) && defined(DUCKDB_EXT_COMMON_OIDC_TLS)
+#error "DUCKDB_EXT_COMMON_OIDC_TLS is the built-in client's TLS: a build without the built-in client has none"
+#endif
+
+#ifndef DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN
 #ifdef DUCKDB_EXT_COMMON_OIDC_TLS
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #endif
 #include "httplib.hpp"
+#endif
 
 #include "oidc_core.hpp"
 
@@ -41,7 +54,7 @@
 
 #ifdef DUCKDB_EXT_COMMON_OIDC_TLS
 namespace hl = duckdb_httplib_openssl;
-#else
+#elif !defined(DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN)
 namespace hl = duckdb_httplib;
 #endif
 
@@ -242,6 +255,7 @@ std::string ReadCaBundle(const std::string &path, std::string &error) {
 }
 #endif
 
+#ifndef DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN
 template <class REQUEST>
 HttpResult Run(const UrlParts &url, int timeout_seconds, REQUEST &&request) {
 	HttpResult out;
@@ -293,6 +307,7 @@ HttpResult Run(const UrlParts &url, int timeout_seconds, REQUEST &&request) {
 	out.body = res->body;
 	return out;
 }
+#endif
 
 //! yyjson helpers over one response body
 struct Json {
@@ -449,12 +464,14 @@ std::string Printable(const std::string &text) {
 	return out;
 }
 
+#ifndef DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN
 //! The page the browser lands on: fixed text, nothing from the request reflected into it.
 std::string CallbackPage(bool ok) {
 	return std::string("<!doctype html><html><head><meta charset=\"utf-8\"><title>Login</title></head><body>"
 	                   "<p>") +
 	       (ok ? "Login complete." : "Login failed.") + " You can close this window.</p></body></html>";
 }
+#endif
 
 //! What the caller presented, cut out of an answer's raw body before anything reads it: an IdP that quotes a
 //! credential back never gets it into an error, even one the description's length limit would cut in two.
@@ -618,6 +635,12 @@ std::shared_ptr<Transport> CurrentTransport() {
 HttpResult BuiltInSend(const std::string &method, const std::string &url,
                        const std::map<std::string, std::string> &headers, const std::string &body,
                        const std::string &content_type, int timeout_seconds) {
+#ifdef DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN
+	(void)method, (void)url, (void)headers, (void)body, (void)content_type, (void)timeout_seconds;
+	HttpResult out;
+	out.error = "this build has no built-in HTTP client (no sockets) - set a transport (SetDefaultTransport)";
+	return out;
+#else
 	auto parts = ParseUrl(url);
 	hl::Headers request_headers;
 	for (auto &header : headers) {
@@ -634,6 +657,7 @@ HttpResult BuiltInSend(const std::string &method, const std::string &url,
 		}
 		return client.send(request);
 	});
+#endif
 }
 
 } // namespace
@@ -1553,8 +1577,10 @@ TokenSet ExchangeAuthorizationCode(const Endpoints &ep, const std::string &clien
 }
 
 struct LoopbackRedirect::Impl {
+#ifndef DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN
 	hl::Server server;
 	std::thread thread;
+#endif
 	int port = 0;
 	bool started = false;
 	std::mutex mutex;
@@ -1564,10 +1590,12 @@ struct LoopbackRedirect::Impl {
 	Result result;
 
 	void Stop() {
+#ifndef DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN
 		server.stop();
 		if (thread.joinable()) {
 			thread.join();
 		}
+#endif
 	}
 };
 
@@ -1585,6 +1613,10 @@ bool LoopbackRedirect::Start(std::string &error) {
 		return false;
 	}
 	state.started = true;
+#ifdef DUCKDB_EXT_COMMON_OIDC_NO_BUILTIN
+	error = "this build has no loopback receiver for the login redirect (no sockets)";
+	return false;
+#else
 	state.server.Get("/callback", [&state](const hl::Request &req, hl::Response &res) {
 		res.set_header("Cache-Control", "no-store");
 		res.set_header("Connection", "close");
@@ -1636,6 +1668,7 @@ bool LoopbackRedirect::Start(std::string &error) {
 	state.thread = std::thread([&state] { state.server.listen_after_bind(); });
 	state.server.wait_until_ready();
 	return true;
+#endif
 }
 
 std::string LoopbackRedirect::RedirectUri() const {

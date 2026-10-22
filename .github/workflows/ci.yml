@@ -61,12 +61,19 @@ jobs:
         run: scripts/test_hooks.sh /tmp/duckdb build/hooks-test
 
   oidc:
-    name: OIDC core test (${{ matrix.os }}, tls=${{ matrix.tls }})
+    name: OIDC core test (${{ matrix.os }}, tls=${{ matrix.tls }}${{ matrix.no_builtin == '1' && ', no built-in client' || '' }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
         tls: ['0', '1']
+        no_builtin: ['0']
+        # the core without its built-in client, as a wasm build compiles it (spec 018): a value of no_builtin the
+        # matrix does not have, so a combination of its own rather than an extension of ubuntu's tls=0
+        include:
+          - os: ubuntu-24.04
+            tls: '0'
+            no_builtin: '1'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -81,6 +88,7 @@ jobs:
       - name: The fake-IdP test
         env:
           OIDC_TLS: ${{ matrix.tls }}
+          OIDC_NO_BUILTIN: ${{ matrix.no_builtin }}
         run: |
           if [ "$RUNNER_OS" = "macOS" ]; then export OPENSSL_ROOT="$(brew --prefix openssl@3)"; fi
           scripts/test_oidc.sh /tmp/duckdb build/oidc-test

@@ -9,6 +9,8 @@
 #
 # OIDC_TLS=1 builds the TLS variant (DUCKDB_EXT_COMMON_OIDC_TLS, against the system OpenSSL -
 # OPENSSL_ROOT points elsewhere, e.g. Homebrew's), the one every consumer ships (spec 003).
+# OIDC_NO_BUILTIN=1 builds the core without its built-in client (spec 018, as a wasm build has it) with its own
+# test, and checks the core's object references no socket, thread or TLS symbol.
 set -euo pipefail
 duckdb="${1:?usage: test_oidc.sh <duckdb source dir> [build dir]}"
 out="${2:-build/oidc-test}"
@@ -16,6 +18,20 @@ cxx="${CXX:-c++}"
 flags="${CXXFLAGS:-}" # extra flags, e.g. the sanitizers
 [ -f "$duckdb/third_party/httplib/httplib.hpp" ] || { echo "test_oidc: no bundled httplib at $duckdb" >&2; exit 1; }
 mkdir -p "$out"
+if [ "${OIDC_NO_BUILTIN:-0}" = "1" ]; then
+	common=(-std=c++17 -O1 -g -DDUCKDB_EXT_COMMON_OIDC_NAMESPACE=ext_common -DDUCKDB_EXT_COMMON_OIDC_NO_BUILTIN=1
+		-I oidc/include -I "$duckdb/third_party/yyjson/include" -I "$duckdb/src/include")
+	"$cxx" $flags "${common[@]}" -c oidc/src/oidc_core.cpp -o "$out/oidc_core_no_builtin.o"
+	# what a page's wasm cannot resolve: sockets, a thread of its own, OpenSSL (macOS prefixes an underscore)
+	if nm -u "$out/oidc_core_no_builtin.o" | grep -E '(^|[ _])(socket|connect|getaddrinfo|bind|listen|accept|send|recv|poll|select|pthread_create|SSL_[A-Za-z_]*|EVP_[A-Za-z_]*)$'; then
+		echo "test_oidc: the core without its built-in client still references the symbols above" >&2
+		exit 1
+	fi
+	"$cxx" $flags "${common[@]}" oidc/test/test_no_builtin.cpp "$out/oidc_core_no_builtin.o" \
+		"$duckdb/third_party/yyjson/yyjson.cpp" -o "$out/test_no_builtin"
+	"$out/test_no_builtin"
+	exit 0
+fi
 # the bundled httplib parses status lines and query strings through duckdb's RegexMatch wrapper over
 # its bundled re2: re2 is compiled in from the same tree and the wrapper is the test's own shim
 # (duckdb's reaches into its exception machinery), so the binary links nothing of a built duckdb
