@@ -37,3 +37,7 @@ share has the same `CONTRACT_VERSION` in both.
 | v0.13.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0-cyanoptera` |
 | v0.13.0 | `acl_lineage_sources` (unchanged) | `ACLS` | 1 | duckdb-acl | `v2.0-cyanoptera` |
 | v0.13.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0-cyanoptera` |
+| v0.14.0 | `acl_audit` (unchanged) | `ACLA` | 3 | duckdb-acl | `v2.0.0` (spec 017: `oidc/` - PKCE on the device flow, `DevicePoll` takes the verifier; a module, not a contract) |
+| v0.14.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0.0` |
+| v0.14.0 | `acl_lineage_sources` (unchanged) | `ACLS` | 1 | duckdb-acl | `v2.0.0` |
+| v0.14.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0.0` |
