@@ -41,3 +41,7 @@ share has the same `CONTRACT_VERSION` in both.
 | v0.14.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0.0` |
 | v0.14.0 | `acl_lineage_sources` (unchanged) | `ACLS` | 1 | duckdb-acl | `v2.0.0` |
 | v0.14.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0.0` |
+| v0.15.0 | `acl_audit` (unchanged) | `ACLA` | 3 | duckdb-acl | `v2.0.0` (spec 018: `oidc/` - no built-in client under wasm; a module, not a contract, and no header change) |
+| v0.15.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0.0` |
+| v0.15.0 | `acl_lineage_sources` (unchanged) | `ACLS` | 1 | duckdb-acl | `v2.0.0` |
+| v0.15.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0.0` |
