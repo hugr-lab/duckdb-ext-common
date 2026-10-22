@@ -1177,14 +1177,14 @@ int main() {
 		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
 		        .count() +
 		    30;
-		auto granted = DevicePoll(ep, "cli", begun.device_code, /*interval*/ 0, deadline);
+		auto granted = DevicePoll(ep, "cli", begun.device_code, "", /*interval*/ 0, deadline);
 		Check(granted.Ok() && granted.access_token == "device-token",
 		      "the poll rides out authorization_pending: " + granted.error);
 		Check(idp.device_polls_seen >= 3, "at least two pendings were actually answered before the grant");
-		auto denied = DevicePoll(ep, "cli", "dc-bogus", 0, deadline);
+		auto denied = DevicePoll(ep, "cli", "dc-bogus", "", 0, deadline);
 		Check(!denied.Ok() && denied.error_code == "access_denied", "an unknown device code is refused");
 		idp.pending_polls = 1000; // never granted - only the cancellation can end this poll
-		auto cancelled = DevicePoll(ep, "cli", begun.device_code, 0, deadline, [] { return true; });
+		auto cancelled = DevicePoll(ep, "cli", begun.device_code, "", 0, deadline, [] { return true; });
 		Check(!cancelled.Ok() && cancelled.error_code == "cancelled",
 		      "a cancellation ends the poll before the deadline");
 	});
@@ -1213,12 +1213,17 @@ int main() {
 			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
 			challenge = idp.device_challenge;
 		}
-		Check(begun.Ok() && !begun.code_verifier.empty() && challenge == PkceChallenge(begun.code_verifier),
-		      "the device request carries the S256 challenge of the verifier it returns - never an extra's");
+		Check(begun.Ok() && begun.code_verifier.size() == 43 && challenge == PkceChallenge(begun.code_verifier),
+		      "the device request carries the S256 challenge of the 43-character verifier it returns - never an "
+		      "extra's");
 		idp.pending_polls = 0;
-		auto without = DevicePoll(pkce, "cli", begun.device_code, 0, deadline);
+		auto without = DevicePoll(pkce, "cli", begun.device_code, "", 0, deadline);
 		Check(!without.Ok() && without.error_code == "invalid_grant", "a poll without the verifier is refused");
-		auto granted = DevicePoll(pkce, "cli", begun.device_code, 0, deadline, nullptr, begun.code_verifier);
+		auto wrong =
+		    DevicePoll(pkce, "cli", begun.device_code, "not-the-verifier-0123456789-0123456789-0123", 0, deadline);
+		Check(!wrong.Ok() && wrong.error.find("not-the-verifier") == std::string::npos,
+		      "a wrong verifier is refused, and never echoed into the error: " + wrong.error);
+		auto granted = DevicePoll(pkce, "cli", begun.device_code, begun.code_verifier, 0, deadline);
 		Check(granted.Ok() && granted.access_token == "device-token", "the poll with it is granted: " + granted.error);
 		idp.advertise_pkce = false;
 		std::lock_guard<std::mutex> guard(idp.exchange_mutex);

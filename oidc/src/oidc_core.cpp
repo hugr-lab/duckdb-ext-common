@@ -1439,8 +1439,8 @@ DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response) {
 }
 
 TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std::string &device_code,
-                    int64_t interval_seconds, int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled,
-                    const std::string &code_verifier) {
+                    const std::string &code_verifier, int64_t interval_seconds, int64_t deadline_epoch_seconds,
+                    const std::function<bool()> &cancelled) {
 	auto interval = interval_seconds < 0 ? 0 : interval_seconds;
 	auto is_cancelled = [&] {
 		return cancelled && cancelled();
@@ -1458,7 +1458,7 @@ TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std
 		if (!code_verifier.empty()) {
 			grant["code_verifier"] = code_verifier; // the device request sent its challenge (spec 017)
 		}
-		auto result = PostGrant(ep, grant);
+		auto result = PostGrant(ep, grant, {device_code, code_verifier}); // never echoed into an error
 		if (result.Ok()) {
 			return result;
 		}

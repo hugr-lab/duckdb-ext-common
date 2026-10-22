@@ -283,11 +283,12 @@ DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response);
 //! cancellation (a query interrupt) is honoured promptly. `interval` of 0
 //! polls without sleeping (tests); the poll never outlives
 //! `deadline_epoch_seconds`.
-//! `code_verifier`: the DeviceAuthorization's (spec 017) - sent when not empty, as the issuer that took the
-//! challenge requires it.
+//! `code_verifier`: the DeviceAuthorization's (spec 017), sent when not empty - an issuer that took the challenge
+//! checks it, whether its client enforces PKCE or not (Keycloak). No default, on purpose: a caller that does not
+//! pass it would fail at every such issuer's poll, so it does not compile.
 TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std::string &device_code,
-                    int64_t interval_seconds, int64_t deadline_epoch_seconds,
-                    const std::function<bool()> &cancelled = nullptr, const std::string &code_verifier = "");
+                    const std::string &code_verifier, int64_t interval_seconds, int64_t deadline_epoch_seconds,
+                    const std::function<bool()> &cancelled = nullptr);
 
 //! PKCE (RFC 7636 §4.2): BASE64URL(SHA256(verifier)), no padding - `S256`, never `plain`.
 std::string PkceChallenge(const std::string &verifier);
