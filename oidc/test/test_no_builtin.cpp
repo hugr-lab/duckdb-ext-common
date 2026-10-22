@@ -69,8 +69,7 @@ int main() {
 		                            const std::map<std::string, std::string> &, const std::string &body,
 		                            const std::string &, int) { return idp.Answer(method, url, body); });
 		auto ep = Discover(ISSUER);
-		Check(ep.error.empty() && ep.token_endpoint == ISSUER + "/token",
-		      "a transport carries discovery: " + ep.error);
+		Check(ep.error.empty() && ep.token_endpoint == ISSUER + "/token", "a transport carries discovery: " + ep.error);
 		auto renewed = RefreshGrant(ep, "spa", "", "rt-1");
 		Check(renewed.Ok() && renewed.access_token == "at-1" && renewed.refresh_token == "rt-2",
 		      "a transport carries a grant: " + renewed.error);
