@@ -326,6 +326,25 @@ struct Json {
 		}
 		return duckdb_yyjson::yyjson_get_sint(value);
 	}
+	//! Whether the array at `key` holds the string `wanted` (a missing key or another type: false).
+	bool ArrayHas(const char *key, const char *wanted) const {
+		if (!doc) {
+			return false;
+		}
+		auto value = duckdb_yyjson::yyjson_obj_get(duckdb_yyjson::yyjson_doc_get_root(doc), key);
+		if (!value || !duckdb_yyjson::yyjson_is_arr(value)) {
+			return false;
+		}
+		using namespace duckdb_yyjson; // NOLINT: the iteration macro names yyjson's functions unqualified
+		size_t idx, max;
+		yyjson_val *item;
+		yyjson_arr_foreach(value, idx, max, item) {
+			if (duckdb_yyjson::yyjson_is_str(item) && std::string(duckdb_yyjson::yyjson_get_str(item)) == wanted) {
+				return true;
+			}
+		}
+		return false;
+	}
 };
 
 //! SHA-256 (FIPS 180-4), for the PKCE challenge only: the module builds without a crypto library.
@@ -716,6 +735,7 @@ Endpoints ParseDiscoveryDocument(const std::string &issuer, const HttpResult &re
 	out.device_authorization_endpoint = json.Str("device_authorization_endpoint");
 	out.authorization_endpoint = json.Str("authorization_endpoint");
 	out.revocation_endpoint = json.Str("revocation_endpoint");
+	out.pkce_s256 = json.ArrayHas("code_challenge_methods_supported", "S256");
 	if (out.token_endpoint.empty()) {
 		out.error = "discovery document carries no token_endpoint";
 		return out;
@@ -1371,10 +1391,22 @@ DeviceAuthorization DeviceBegin(const Endpoints &ep, const std::string &client_i
 	if (!scope.empty()) {
 		params["scope"] = scope;
 	}
+	// PKCE on the device flow (spec 017): an issuer that advertises S256 may require it here too (Keycloak does
+	// for a client with PKCE enforced); one that advertises nothing (Entra) is sent none
+	std::string verifier;
+	if (ep.pkce_s256) {
+		verifier = RandomUrlSafe(32);
+		params["code_challenge"] = PkceChallenge(verifier);
+		params["code_challenge_method"] = "S256";
+	}
 	for (auto &param : extra) {
 		params.emplace(param.first, param.second);
 	}
-	return ParseDeviceAuthorization(HttpPostForm(ep.device_authorization_endpoint, params));
+	auto begun = ParseDeviceAuthorization(HttpPostForm(ep.device_authorization_endpoint, params));
+	if (begun.Ok()) {
+		begun.code_verifier = std::move(verifier);
+	}
+	return begun;
 }
 
 DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response) {
@@ -1407,7 +1439,8 @@ DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response) {
 }
 
 TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std::string &device_code,
-                    int64_t interval_seconds, int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled) {
+                    int64_t interval_seconds, int64_t deadline_epoch_seconds, const std::function<bool()> &cancelled,
+                    const std::string &code_verifier) {
 	auto interval = interval_seconds < 0 ? 0 : interval_seconds;
 	auto is_cancelled = [&] {
 		return cancelled && cancelled();
@@ -1419,9 +1452,13 @@ TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std
 			out.error_code = "cancelled";
 			return out;
 		}
-		auto result = PostGrant(ep, {{"grant_type", "urn:ietf:params:oauth:grant-type:device_code"},
-		                             {"client_id", client_id},
-		                             {"device_code", device_code}});
+		std::map<std::string, std::string> grant {{"grant_type", "urn:ietf:params:oauth:grant-type:device_code"},
+		                                          {"client_id", client_id},
+		                                          {"device_code", device_code}};
+		if (!code_verifier.empty()) {
+			grant["code_verifier"] = code_verifier; // the device request sent its challenge (spec 017)
+		}
+		auto result = PostGrant(ep, grant);
 		if (result.Ok()) {
 			return result;
 		}

@@ -117,7 +117,8 @@ struct Endpoints {
 	std::string device_authorization_endpoint; // may be empty: not every issuer offers RFC 8628
 	std::string authorization_endpoint;        // may be empty: a machine-only issuer has no browser flow
 	std::string revocation_endpoint;           // may be empty: RFC 7009 not offered (spec 011)
-	std::string error;                         // non-empty when discovery failed
+	bool pkce_s256 = false; // `code_challenge_methods_supported` lists S256: the device flow sends PKCE (spec 017)
+	std::string error;      // non-empty when discovery failed
 
 	bool Ok() const {
 		return error.empty() && !token_endpoint.empty();
@@ -254,6 +255,7 @@ struct DeviceAuthorization {
 	std::string user_code;
 	std::string verification_uri;
 	std::string verification_uri_complete; // may be empty
+	std::string code_verifier;             // PKCE (spec 017): when the request sent a challenge - DevicePoll's to send
 	int64_t interval = 5;                  // seconds between polls
 	int64_t expires_in = 600;
 	std::string error;
@@ -281,9 +283,11 @@ DeviceAuthorization ParseDeviceAuthorization(const HttpResult &response);
 //! cancellation (a query interrupt) is honoured promptly. `interval` of 0
 //! polls without sleeping (tests); the poll never outlives
 //! `deadline_epoch_seconds`.
+//! `code_verifier`: the DeviceAuthorization's (spec 017) - sent when not empty, as the issuer that took the
+//! challenge requires it.
 TokenSet DevicePoll(const Endpoints &ep, const std::string &client_id, const std::string &device_code,
                     int64_t interval_seconds, int64_t deadline_epoch_seconds,
-                    const std::function<bool()> &cancelled = nullptr);
+                    const std::function<bool()> &cancelled = nullptr, const std::string &code_verifier = "");
 
 //! PKCE (RFC 7636 §4.2): BASE64URL(SHA256(verifier)), no padding - `S256`, never `plain`.
 std::string PkceChallenge(const std::string &verifier);

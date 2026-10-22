@@ -345,6 +345,8 @@ struct FakeIdp {
 	int port = 0;
 	std::atomic<int> pending_polls {0};
 	std::atomic<int> device_polls_seen {0};
+	std::atomic<bool> advertise_pkce {false}; // spec 017: discovery lists S256, and the device flow then requires it
+	std::string device_challenge;             // the code_challenge of the last /device (under exchange_mutex)
 	std::mutex auth_mutex;
 	std::string auth_challenge;    // the code_challenge of the last /authorize
 	std::string auth_redirect_uri; // and its redirect_uri
@@ -370,14 +372,16 @@ struct FakeIdp {
 	}
 
 	void Start() {
-		server.Get("/.well-known/openid-configuration",
-		           [this](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
-			           res.set_content("{\"issuer\":\"" + Issuer() + "\",\"token_endpoint\":\"" + Issuer() +
-			                               "/token\",\"device_authorization_endpoint\":\"" + Issuer() +
-			                               "/device\",\"authorization_endpoint\":\"" + Issuer() +
-			                               "/authorize\",\"revocation_endpoint\":\"" + Issuer() + "/revoke\"}",
-			                           "application/json");
-		           });
+		server.Get("/.well-known/openid-configuration", [this](const duckdb_httplib::Request &,
+		                                                       duckdb_httplib::Response &res) {
+			res.set_content("{\"issuer\":\"" + Issuer() + "\",\"token_endpoint\":\"" + Issuer() +
+			                    "/token\",\"device_authorization_endpoint\":\"" + Issuer() +
+			                    "/device\",\"authorization_endpoint\":\"" + Issuer() +
+			                    "/authorize\",\"revocation_endpoint\":\"" + Issuer() + "/revoke\"" +
+			                    (advertise_pkce ? ",\"code_challenge_methods_supported\":[\"plain\",\"S256\"]" : "") +
+			                    "}",
+			                "application/json");
+		});
 		// a LYING document: served at /realms/other, speaking for the root issuer - discovery asked
 		// about /realms/other must refuse it on the issuer check, not on a 404
 		server.Get("/realms/other/.well-known/openid-configuration", [this](const duckdb_httplib::Request &,
@@ -492,6 +496,16 @@ struct FakeIdp {
 			{
 				std::lock_guard<std::mutex> guard(exchange_mutex);
 				last_device_audience = req.get_param_value("audience");
+				device_challenge = req.get_param_value("code_challenge");
+				// as Keycloak with PKCE enforced: a challenge is required, S256 only
+				if (advertise_pkce &&
+				    (device_challenge.empty() || req.get_param_value("code_challenge_method") != "S256")) {
+					res.status = 400;
+					res.set_content("{\"error\":\"invalid_request\",\"error_description\":\"Missing parameter: "
+					                "code_challenge_method\"}",
+					                "application/json");
+					return;
+				}
 			}
 			res.set_content("{\"device_code\":\"dc-1\",\"user_code\":\"WDJB-MJHT\",\"verification_uri\":\"" + Issuer() +
 			                    "/activate\",\"interval\":0,\"expires_in\":60}",
@@ -695,8 +709,15 @@ struct FakeIdp {
 			}
 			if (grant == "urn:ietf:params:oauth:grant-type:device_code") {
 				device_polls_seen++;
+				std::string challenge;
+				{
+					std::lock_guard<std::mutex> guard(exchange_mutex);
+					challenge = device_challenge;
+				}
 				if (req.get_param_value("device_code") != "dc-1") {
 					deny("access_denied", "unknown device code");
+				} else if (!challenge.empty() && PkceChallenge(req.get_param_value("code_verifier")) != challenge) {
+					deny("invalid_grant", "PKCE verification failed");
 				} else if (pending_polls.fetch_sub(1) > 0) {
 					deny("authorization_pending", "the user has not approved yet");
 				} else {
@@ -1166,6 +1187,42 @@ int main() {
 		auto cancelled = DevicePoll(ep, "cli", begun.device_code, 0, deadline, [] { return true; });
 		Check(!cancelled.Ok() && cancelled.error_code == "cancelled",
 		      "a cancellation ends the poll before the deadline");
+	});
+
+	Scenario("device flow - PKCE where the issuer advertises S256 (spec 017)", [&] {
+		auto deadline =
+		    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+		        .count() +
+		    30;
+		auto plain = Discover(idp.Issuer());
+		auto begun = DeviceBegin(plain, "cli");
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			Check(!plain.pkce_s256 && begun.Ok() && begun.code_verifier.empty() && idp.device_challenge.empty(),
+			      "an issuer that advertises no PKCE is sent none (Entra)");
+		}
+		idp.advertise_pkce = true;
+		auto pkce = Discover(idp.Issuer());
+		Check(pkce.pkce_s256, "code_challenge_methods_supported with S256 is read");
+		auto refused = DeviceBegin(plain, "cli");
+		Check(!refused.Ok() && refused.error.find("code_challenge_method") != std::string::npos,
+		      "without it, an issuer that requires PKCE refuses the device request: " + refused.error);
+		begun = DeviceBegin(pkce, "cli", "", {{"code_challenge", "forged"}});
+		std::string challenge;
+		{
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			challenge = idp.device_challenge;
+		}
+		Check(begun.Ok() && !begun.code_verifier.empty() && challenge == PkceChallenge(begun.code_verifier),
+		      "the device request carries the S256 challenge of the verifier it returns - never an extra's");
+		idp.pending_polls = 0;
+		auto without = DevicePoll(pkce, "cli", begun.device_code, 0, deadline);
+		Check(!without.Ok() && without.error_code == "invalid_grant", "a poll without the verifier is refused");
+		auto granted = DevicePoll(pkce, "cli", begun.device_code, 0, deadline, nullptr, begun.code_verifier);
+		Check(granted.Ok() && granted.access_token == "device-token", "the poll with it is granted: " + granted.error);
+		idp.advertise_pkce = false;
+		std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+		idp.device_challenge.clear();
 	});
 
 	Scenario("PKCE: the RFC 7636 appendix B vector, and fresh randomness", [&] {
