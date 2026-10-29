@@ -844,8 +844,10 @@ void WipeString(std::string &text) {
 	text.clear();
 }
 
+constexpr const char *JWT_BEARER_ASSERTION = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
 //! The client's proof in a grant's form: an assertion (signed here, for this endpoint, or a federated one as
-//! is), or the secret. False with `error` when a key cannot sign.
+//! is, of its `assertion_type`), or the secret. False with `error` when a key cannot sign.
 bool AddClientAuth(std::map<std::string, std::string> &params, const Endpoints &ep, const ClientAuth &auth,
                    std::string &error) {
 	if (!ep.Ok()) {
@@ -854,7 +856,13 @@ bool AddClientAuth(std::map<std::string, std::string> &params, const Endpoints &
 	}
 	params["client_id"] = auth.client_id;
 	std::string assertion = auth.assertion;
+	auto assertion_type = auth.assertion_type.empty() ? std::string(JWT_BEARER_ASSERTION) : auth.assertion_type;
 	if (!auth.private_key_pem.empty()) {
+		// RFC 7523 §2.2: an assertion this client signs is jwt-bearer; another type is the platform's own token
+		if (assertion_type != JWT_BEARER_ASSERTION) {
+			error = "a client assertion signed with a private key is jwt-bearer, not " + assertion_type;
+			return false;
+		}
 		// the token endpoint, as RFC 7523 and Entra, Okta, Keycloak have it; Auth0 wants its issuer URL
 		auto audience = auth.assertion_audience.empty() ? ep.token_endpoint : auth.assertion_audience;
 		auto signed_assertion =
@@ -866,7 +874,7 @@ bool AddClientAuth(std::map<std::string, std::string> &params, const Endpoints &
 		assertion = std::move(signed_assertion.jwt);
 	}
 	if (!assertion.empty()) {
-		params["client_assertion_type"] = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+		params["client_assertion_type"] = assertion_type;
 		params["client_assertion"] = std::move(assertion);
 	} else if (!auth.client_secret.empty()) {
 		params["client_secret"] = auth.client_secret;

@@ -522,9 +522,16 @@ struct FakeIdp {
 				std::lock_guard<std::mutex> guard(exchange_mutex);
 				auto client = req.get_param_value("client_id");
 				auto assertion = req.get_param_value("client_assertion");
+				// as Keycloak's SPIFFE authentication (spec 019): a JWT-SVID only as jwt-spiffe, others jwt-bearer
+				auto spiffe = client == "spiffe-client";
 				if (req.get_param_value("client_assertion_type") !=
-				    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer") {
-					deny("invalid_client", "not a jwt-bearer assertion");
+				    (spiffe ? "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe"
+				            : "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")) {
+					deny("invalid_client", spiffe ? "not a jwt-spiffe assertion" : "not a jwt-bearer assertion");
+				} else if (spiffe) {
+					assertion == "svid-jwt"
+					    ? res.set_content("{\"access_token\":\"spiffe-token\",\"expires_in\":60}", "application/json")
+					    : deny("invalid_client", "an SVID the trust domain did not issue");
 				} else if (client == "quote-client") {
 					// an IdP that quotes the assertion back: it must never reach the caller's error
 					deny("invalid_client", "assertion " + assertion + " is not trusted");
@@ -1042,6 +1049,30 @@ int main() {
 		auto refused = ClientCredentials(ep, federated);
 		Check(!refused.Ok() && refused.error.find("untrusted-platform-jwt") == std::string::npos,
 		      "an untrusted one is refused, and not quoted: " + refused.error);
+	});
+
+	Scenario("the assertion's type - a JWT-SVID as jwt-spiffe (spec 019)", [&] {
+		ClientAuth svid;
+		svid.client_id = "spiffe-client";
+		svid.assertion = "svid-jwt";
+		auto as_bearer = ClientCredentials(ep, svid);
+		Check(!as_bearer.Ok() && as_bearer.error_code == "invalid_client",
+		      "no type given is jwt-bearer, as before - which a SPIFFE client refuses: " + as_bearer.error);
+		svid.assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
+		auto granted = ClientCredentials(ep, svid);
+		Check(granted.Ok() && granted.access_token == "spiffe-token", "sent as jwt-spiffe: " + granted.error);
+		ClientAuth federated;
+		federated.client_id = "fed-client";
+		federated.assertion = "platform-jwt";
+		federated.assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+		Check(ClientCredentials(ep, federated).Ok(), "jwt-bearer named explicitly is jwt-bearer");
+		ClientAuth keyed;
+		keyed.client_id = "keyed-client";
+		keyed.private_key_pem = "a key";
+		keyed.assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
+		auto refused = ClientCredentials(ep, keyed);
+		Check(!refused.Ok() && refused.error.find("jwt-bearer") != std::string::npos,
+		      "an assertion signed here is jwt-bearer, never another type: " + refused.error);
 	});
 
 	Scenario("Azure managed identity - IMDS and the App Service endpoint (spec 012)", [&] {
