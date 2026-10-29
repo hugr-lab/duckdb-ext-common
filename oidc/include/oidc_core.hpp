@@ -151,7 +151,10 @@ struct TokenSet {
 //!   the token endpoint it goes to (or `assertion_audience`: Auth0 wants its issuer URL); `key_id` sets the
 //!   header's kid, `certificate_pem` adds x5t / x5t#S256;
 //! - `assertion` (a federated client assertion): a JWT the platform issued - a Kubernetes service-account
-//!   token, GitHub Actions' OIDC token - presented as is;
+//!   token, GitHub Actions' OIDC token, a SPIFFE JWT-SVID - presented as is, as `assertion_type` (the full URN;
+//!   empty: RFC 7523's jwt-bearer; Keycloak's SPIFFE authentication wants
+//!   urn:ietf:params:oauth:client-assertion-type:jwt-spiffe, spec 019). An assertion signed here is always
+//!   jwt-bearer;
 //! - `client_secret` (client_secret_post).
 //! Signing needs a TLS build (OpenSSL). Nothing of a key, a certificate, an assertion or a secret reaches an
 //! error: what the caller presented is cut out of the IdP's answer before it is read.
@@ -163,6 +166,7 @@ struct ClientAuth {
 	std::string certificate_pem;
 	std::string assertion_audience;
 	std::string assertion;
+	std::string assertion_type;
 };
 
 //! RFC 7523: a client assertion - iss = sub = client_id, aud = `audience` (the token endpoint), jti random,
