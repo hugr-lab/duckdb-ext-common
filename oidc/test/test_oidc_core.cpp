@@ -1073,6 +1073,20 @@ int main() {
 		auto refused = ClientCredentials(ep, keyed);
 		Check(!refused.Ok() && refused.error.find("jwt-bearer") != std::string::npos,
 		      "an assertion signed here is jwt-bearer, never another type: " + refused.error);
+		// a type without an assertion (the client-secret path) is refused, not ignored
+		ClientAuth secret;
+		secret.client_id = "node";
+		secret.client_secret = "node-secret";
+		secret.assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
+		auto unused = ClientCredentials(ep, secret);
+		Check(!unused.Ok() && unused.error.find("without an assertion") != std::string::npos,
+		      "a type with no assertion is refused before anything is sent: " + unused.error);
+		// every grant that authenticates the client takes the type: token exchange too
+		auto exchanged = TokenExchange(ep, svid, "user-token-for-node", "api");
+		(void)exchanged;
+		Check(idp.last_exchange["client_assertion_type"] == "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe" &&
+		          idp.last_exchange["client_assertion"] == "svid-jwt",
+		      "a token exchange sends the assertion as its type");
 	});
 
 	Scenario("Azure managed identity - IMDS and the App Service endpoint (spec 012)", [&] {

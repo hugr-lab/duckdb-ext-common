@@ -873,6 +873,11 @@ bool AddClientAuth(std::map<std::string, std::string> &params, const Endpoints &
 		}
 		assertion = std::move(signed_assertion.jwt);
 	}
+	if (assertion.empty() && !auth.assertion_type.empty()) {
+		// a type names an assertion: without one it would go unused and the client's proof be another than asked
+		error = "an assertion type (" + auth.assertion_type + ") without an assertion";
+		return false;
+	}
 	if (!assertion.empty()) {
 		params["client_assertion_type"] = assertion_type;
 		params["client_assertion"] = std::move(assertion);
