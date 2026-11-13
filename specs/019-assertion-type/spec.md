@@ -50,8 +50,8 @@ takes the same tag as tresor** before a tresor carrying it is built in there - a
 `oidc/test/test_oidc_core.cpp`, the fake IdP with a client as Keycloak's SPIFFE authentication (`spiffe-client`:
 `jwt-spiffe` only): no type is `jwt-bearer`, which it refuses; `jwt-spiffe` is granted; `jwt-bearer` named explicitly
 is `jwt-bearer` (`fed-client`); a key with another type is refused before signing; a type with no assertion (a client
-secret) is refused before sending; a token exchange sends the assertion as its type. Plain, `OIDC_TLS=1` and
-`OIDC_NO_BUILTIN=1`.
+secret) is refused before sending; a token exchange and an On-Behalf-Of send the assertion as its type. Plain and
+`OIDC_TLS=1`; `OIDC_NO_BUILTIN=1` (`test_no_builtin.cpp`) only compiles and links it, with no transport to exercise.
 
 ## Alternatives considered
 

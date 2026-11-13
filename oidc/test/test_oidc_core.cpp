@@ -1056,7 +1056,8 @@ int main() {
 		svid.client_id = "spiffe-client";
 		svid.assertion = "svid-jwt";
 		auto as_bearer = ClientCredentials(ep, svid);
-		Check(!as_bearer.Ok() && as_bearer.error_code == "invalid_client",
+		Check(!as_bearer.Ok() && as_bearer.error_code == "invalid_client" &&
+		          as_bearer.error.find("not a jwt-spiffe assertion") != std::string::npos,
 		      "no type given is jwt-bearer, as before - which a SPIFFE client refuses: " + as_bearer.error);
 		svid.assertion_type = "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe";
 		auto granted = ClientCredentials(ep, svid);
@@ -1081,12 +1082,17 @@ int main() {
 		auto unused = ClientCredentials(ep, secret);
 		Check(!unused.Ok() && unused.error.find("without an assertion") != std::string::npos,
 		      "a type with no assertion is refused before anything is sent: " + unused.error);
-		// every grant that authenticates the client takes the type: token exchange too
-		auto exchanged = TokenExchange(ep, svid, "user-token-for-node", "api");
-		(void)exchanged;
-		Check(idp.last_exchange["client_assertion_type"] == "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe" &&
-		          idp.last_exchange["client_assertion"] == "svid-jwt",
-		      "a token exchange sends the assertion as its type");
+		// every grant that authenticates the client takes the type: token exchange and On-Behalf-Of too
+		auto sent_as_type = [&]() {
+			std::lock_guard<std::mutex> guard(idp.exchange_mutex);
+			return idp.last_exchange["client_assertion_type"] ==
+			           "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe" &&
+			       idp.last_exchange["client_assertion"] == "svid-jwt";
+		};
+		(void)TokenExchange(ep, svid, "user-token-for-node", "api");
+		Check(sent_as_type(), "a token exchange sends the assertion as its type");
+		(void)OnBehalfOf(ep, svid, "user-token-for-node", "api://secrets/.default");
+		Check(sent_as_type(), "an On-Behalf-Of sends the assertion as its type");
 	});
 
 	Scenario("Azure managed identity - IMDS and the App Service endpoint (spec 012)", [&] {
