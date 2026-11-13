@@ -2,7 +2,7 @@
 
 - **Status**: implemented
 - **Date**: 2026-10-29
-- **Author**: hugr lab (the tresor session)
+- **Author**: Örjan Lundberg (@oluies); review changes by hugr lab
 - **Consumer side**: tresor spec 046 (a node's SPIFFE login: `ASSERTION_TYPE` on its `tresor` secret); duckdb-acl
   unchanged (it sends no federated assertion)
 
@@ -25,6 +25,8 @@ never replace the core's own (`emplace`), by design.
 - `ClientAuth::assertion_type` (`std::string`, after `assertion`): the full URN; empty is `jwt-bearer`. The core does
   not list types: an IdP's type is the IdP's, and a consumer names the ones it offers (tresor: `jwt-bearer`,
   `jwt-spiffe`).
+- A type with no assertion (the client-secret path) is refused before anything is sent ("an assertion type (…)
+  without an assertion"): it would otherwise go unused, and the client prove itself otherwise than it asked.
 - It applies to the caller's `assertion` only. An assertion signed here (`private_key_pem`, private_key_jwt) is
   `jwt-bearer` (RFC 7523 §2.2); another type with a key is refused before anything is signed or sent ("a client
   assertion signed with a private key is jwt-bearer, not …").
@@ -34,16 +36,22 @@ never replace the core's own (`emplace`), by design.
 
 ## Compatibility
 
-A source change of the module, no contract: no `CONTRACT_VERSION` moves, `check_headers.sh` is unaffected
-(`oidc/` is not a header-only base). `ClientAuth` grows a member: a consumer that aggregate-initializes it
-positionally still compiles (the new member is last). Consumers rebuild when they take the tag; until then nothing
-changes for them. Checked with the 2.0 line (DuckDB v2.0.0, d54cbbe).
+No contract changes: no `CONTRACT_VERSION` moves, and `check_headers.sh` is unaffected (`oidc/` is not a header-only
+base). `ClientAuth` grows a member: a consumer that aggregate-initializes it positionally still compiles (the new
+member is last). Consumers rebuild when they take the tag. Checked with the 2.0 line (DuckDB v2.0.0, d54cbbe).
+
+**`oidc/include/oidc_core.hpp` changes**, and an extension that builds tresor and duckdb-acl into one image (hugr-node)
+compares their copies of `oidc/include/*` byte for byte (tresor's `tresor_check_shared_headers`). So **duckdb-acl
+takes the same tag as tresor** before a tresor carrying it is built in there - a pin bump, no code change in acl. The
+`docs/compatibility.md` rows of the tag (added with it, as for v0.15.0) say so.
 
 ## Testing
 
 `oidc/test/test_oidc_core.cpp`, the fake IdP with a client as Keycloak's SPIFFE authentication (`spiffe-client`:
 `jwt-spiffe` only): no type is `jwt-bearer`, which it refuses; `jwt-spiffe` is granted; `jwt-bearer` named explicitly
-is `jwt-bearer` (`fed-client`); a key with another type is refused before signing. Plain and `OIDC_TLS=1`.
+is `jwt-bearer` (`fed-client`); a key with another type is refused before signing; a type with no assertion (a client
+secret) is refused before sending; a token exchange sends the assertion as its type. Plain, `OIDC_TLS=1` and
+`OIDC_NO_BUILTIN=1`.
 
 ## Alternatives considered
 
@@ -54,4 +62,4 @@ is `jwt-bearer` (`fed-client`); a key with another type is refused before signin
 
 ## Follow-ups
 
-- A tag with this change, and its `docs/compatibility.md` row (no contract change); tresor moves its pin to it.
+- A tag with this change, and its `docs/compatibility.md` row (no contract change); tresor and duckdb-acl move their pins to it together.
