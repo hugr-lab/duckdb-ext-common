@@ -45,3 +45,7 @@ share has the same `CONTRACT_VERSION` in both.
 | v0.15.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0.0` |
 | v0.15.0 | `acl_lineage_sources` (unchanged) | `ACLS` | 1 | duckdb-acl | `v2.0.0` |
 | v0.15.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0.0` |
+| v0.16.0 | `acl_audit` (unchanged) | `ACLA` | 3 | duckdb-acl | `v2.0.0` (spec 019: `oidc/` - `ClientAuth::assertion_type`, a JWT-SVID as jwt-spiffe; a module, not a contract, but `oidc_core.hpp` changes, so duckdb-acl takes this tag with tresor) |
+| v0.16.0 | `acl_connection` (unchanged) | `ACLC` | 2 | duckdb-acl | `v2.0.0` |
+| v0.16.0 | `acl_lineage_sources` (unchanged) | `ACLS` | 1 | duckdb-acl | `v2.0.0` |
+| v0.16.0 | `tresor_audit` (unchanged) | `TRSA` | 1 | tresor | `v2.0.0` |
